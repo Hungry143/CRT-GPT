@@ -1,0 +1,6 @@
+{
+  "name": "CRT Intelligence",
+  "description": "Stage 1 foundation shell for XAUUSD discretionary CRT market monitoring, diagnostics APIs, and isolated TradingView chart display.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
