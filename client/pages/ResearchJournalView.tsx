@@ -79,12 +79,12 @@ export function ResearchJournalView() {
               Planned Backend Module Roadmap
             </h2>
             <p className="text-xs text-[#8B9BB0] mt-0.5">
-              Documented boundaries for future milestones — none implemented in
-              Stage 1
+              Stage 2A read-only market-data foundation modules and planned
+              future strategy modules
             </p>
           </div>
           <span className="font-mono text-xs text-[#64748B]">
-            8 planned modules
+            {PLANNED_ARCHITECTURE_MODULES.length} modules
           </span>
         </div>
 
@@ -102,7 +102,7 @@ export function ResearchJournalView() {
                   Intended Responsibility
                 </th>
                 <th scope="col" className="py-2.5 pl-3 pr-5 font-medium text-right">
-                  Stage 1 Status
+                  Status
                 </th>
               </tr>
             </thead>
@@ -118,8 +118,16 @@ export function ResearchJournalView() {
                   <td className="py-3 px-3 text-[#94A3B8] leading-relaxed min-w-[260px]">
                     {mod.responsibility}
                   </td>
-                  <td className="py-3 pl-3 pr-5 font-mono text-[#64748B] text-right whitespace-nowrap">
-                    Not implemented
+                  <td
+                    className={`py-3 pl-3 pr-5 font-mono text-right whitespace-nowrap ${
+                      mod.status === 'STAGE_2A_FOUNDATION'
+                        ? 'text-emerald-400'
+                        : 'text-[#64748B]'
+                    }`}
+                  >
+                    {mod.status === 'STAGE_2A_FOUNDATION'
+                      ? 'Stage 2A contract'
+                      : 'Not implemented'}
                   </td>
                 </tr>
               ))}

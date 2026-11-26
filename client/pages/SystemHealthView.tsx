@@ -2,6 +2,7 @@
 
 import { AlertCircle, CheckCircle2, RefreshCw } from 'lucide-react';
 import type { DiagnosticsSnapshot } from '@/client/services/apiClient';
+import { DataIntegrityPanel } from '@/client/components/DataIntegrityPanel';
 import { NO_DATA_DASH } from '@/shared/utils/display';
 import { formatKolkataClock, formatNewYorkClock } from '@/shared/utils/time';
 
@@ -16,8 +17,23 @@ export function SystemHealthView({
   isRefreshing,
   onRefresh,
 }: SystemHealthViewProps) {
-  const { health, systemStatus, instruments, signals } = diagnostics;
-  const allOk = health.ok && systemStatus.ok && instruments.ok && signals.ok;
+  const {
+    health,
+    systemStatus,
+    instruments,
+    signals,
+    marketStatus,
+    marketCandles,
+    marketSession,
+  } = diagnostics;
+  const allOk =
+    health.ok &&
+    systemStatus.ok &&
+    instruments.ok &&
+    signals.ok &&
+    marketStatus.ok &&
+    marketCandles.ok &&
+    marketSession.ok;
   const anyDown = !allOk;
 
   const endpointRows = [
@@ -49,6 +65,27 @@ export function SystemHealthView({
         ? `${signals.data.data.length} signals (${signals.data.state})`
         : signals.error ?? 'Unavailable',
     },
+    {
+      path: 'GET /api/market/status',
+      result: marketStatus,
+      summary: marketStatus.data
+        ? `${marketStatus.data.adapterName} · ${marketStatus.data.quality.state} · ${marketStatus.data.historyPersistence}`
+        : marketStatus.error ?? 'Unavailable',
+    },
+    {
+      path: 'GET /api/market/candles',
+      result: marketCandles,
+      summary: marketCandles.data
+        ? `${marketCandles.data.count} completed bars (${marketCandles.data.status})`
+        : marketCandles.error ?? 'Unavailable',
+    },
+    {
+      path: 'GET /api/market/session',
+      result: marketSession,
+      summary: marketSession.data
+        ? `${marketSession.data.session.nyAbbreviation} (${marketSession.data.session.nyOffset}) · ${marketSession.data.session.observedMarketAvailability}`
+        : marketSession.error ?? 'Unavailable',
+    },
   ];
 
   const serverTimeUtc =
@@ -77,9 +114,9 @@ export function SystemHealthView({
                 Backend diagnostics API failure detected
               </p>
               <p className="mt-1 text-red-200/90">
-                One or more Stage 1 backend endpoints failed to respond or did
-                not pass strict schema validation. Review individual endpoint
-                diagnostics below.
+                One or more backend endpoints failed to respond or did not pass
+                strict schema validation. Review individual endpoint diagnostics
+                below.
               </p>
             </div>
           </div>
@@ -108,8 +145,9 @@ export function SystemHealthView({
                 Diagnostics APIs Reachable
               </p>
               <p className="mt-0.5 text-[#94A3B8]">
-                All 4 Stage 1 backend contracts passed Zod schema verification.
-                Market data feed and CRT engine remain intentionally disabled.
+                All 7 Stage 1 and Stage 2A backend contracts passed Zod schema
+                verification. Market data feed and CRT engine remain
+                intentionally disabled.
               </p>
             </div>
           </div>
@@ -127,6 +165,11 @@ export function SystemHealthView({
           </button>
         </div>
       )}
+
+      <DataIntegrityPanel
+        marketStatus={marketStatus.data}
+        marketSession={marketSession.data}
+      />
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-stretch">
         <section

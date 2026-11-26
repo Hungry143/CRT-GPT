@@ -204,4 +204,7 @@ export interface FeatureGateSnapshot {
   MARKET_FEED_ENABLED: boolean;
   CRT_ENGINE_ENABLED: boolean;
   SIGNALS_ENABLED: boolean;
+  BACKFILL_ENABLED?: boolean;
 }
+
+export * from './marketData';

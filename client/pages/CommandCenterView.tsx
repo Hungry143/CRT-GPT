@@ -2,6 +2,7 @@
 
 import { ShieldAlert } from 'lucide-react';
 import type { DiagnosticsSnapshot } from '@/client/services/apiClient';
+import { DataIntegrityPanel } from '@/client/components/DataIntegrityPanel';
 import { MarketStatusPanel } from '@/client/components/MarketStatusPanel';
 import { OpportunityRadarPanel } from '@/client/components/OpportunityRadarPanel';
 import { TimeframePanel } from '@/client/components/TimeframePanel';
@@ -36,7 +37,8 @@ export function CommandCenterView({
           <p className="mt-1 text-[#CBD5E1]">
             The embedded TradingView chart below is an independent third-party
             display widget only. Backend market-data ingestion, CRT analysis,
-            and signal generation are disabled in Stage 1.
+            and signal generation remain disabled until a verified provider is
+            configured.
           </p>
         </div>
       </div>
@@ -53,6 +55,11 @@ export function CommandCenterView({
         />
         <TimeframePanel systemStatus={systemStatus} />
       </div>
+
+      <DataIntegrityPanel
+        marketStatus={diagnostics.marketStatus.data}
+        marketSession={diagnostics.marketSession.data}
+      />
 
       <OpportunityRadarPanel
         signalsResponse={diagnostics.signals.data}

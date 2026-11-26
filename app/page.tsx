@@ -1,11 +1,13 @@
 import { AppShell } from '@/client/components/AppShell';
+import type { NavSectionId } from '@/client/components/SidebarNav';
 import type { DiagnosticsSnapshot } from '@/client/services/apiClient';
 import { buildHealthPayload } from '@/server/routes/health';
 import { buildInstrumentsPayload } from '@/server/routes/instruments';
+import { buildMarketCandlesPayload } from '@/server/routes/marketCandles';
+import { buildMarketSessionPayload } from '@/server/routes/marketSession';
+import { buildMarketStatusPayload } from '@/server/routes/marketStatus';
 import { buildSignalsPayload } from '@/server/routes/signals';
 import { buildSystemStatusPayload } from '@/server/routes/systemStatus';
-
-import type { NavSectionId } from '@/client/components/SidebarNav';
 
 export const dynamic = 'force-dynamic';
 
@@ -33,6 +35,16 @@ export default async function HomePage({ searchParams }: HomePageProps) {
 
   const now = new Date();
   const checkedAtUtc = now.toISOString();
+
+  const [marketStatusData, marketCandlesData, marketSessionData] =
+    await Promise.all([
+      buildMarketStatusPayload(now),
+      buildMarketCandlesPayload(
+        { instrument: 'XAUUSD', granularity: 'M15', limit: 100 },
+        now
+      ),
+      buildMarketSessionPayload(now),
+    ]);
 
   const initialDiagnostics: DiagnosticsSnapshot = {
     health: {
@@ -64,6 +76,30 @@ export default async function HomePage({ searchParams }: HomePageProps) {
       ok: true,
       httpStatus: 200,
       data: buildSignalsPayload(),
+      error: null,
+      checkedAtUtc,
+    },
+    marketStatus: {
+      endpoint: '/api/market/status',
+      ok: true,
+      httpStatus: 200,
+      data: marketStatusData,
+      error: null,
+      checkedAtUtc,
+    },
+    marketCandles: {
+      endpoint: '/api/market/candles?instrument=XAUUSD&granularity=M15&limit=100',
+      ok: true,
+      httpStatus: 200,
+      data: marketCandlesData,
+      error: null,
+      checkedAtUtc,
+    },
+    marketSession: {
+      endpoint: '/api/market/session',
+      ok: true,
+      httpStatus: 200,
+      data: marketSessionData,
       error: null,
       checkedAtUtc,
     },

@@ -1,10 +1,16 @@
 import {
   HealthResponseSchema,
   InstrumentsResponseSchema,
+  MarketCandlesResponseSchema,
+  MarketSessionResponseSchema,
+  MarketStatusResponseSchema,
   SignalsResponseSchema,
   SystemStatusResponseSchema,
   type HealthResponse,
   type InstrumentsResponse,
+  type MarketCandlesResponse,
+  type MarketSessionResponse,
+  type MarketStatusResponse,
   type SignalsResponse,
   type SystemStatusResponse,
 } from '@/shared/contracts/api';
@@ -24,6 +30,9 @@ export interface DiagnosticsSnapshot {
   systemStatus: EndpointCheckResult<SystemStatusResponse>;
   instruments: EndpointCheckResult<InstrumentsResponse>;
   signals: EndpointCheckResult<SignalsResponse>;
+  marketStatus: EndpointCheckResult<MarketStatusResponse>;
+  marketCandles: EndpointCheckResult<MarketCandlesResponse>;
+  marketSession: EndpointCheckResult<MarketSessionResponse>;
 }
 
 async function fetchValidatedJson<T>(
@@ -119,14 +128,55 @@ export async function fetchSignals(
   return fetchValidatedJson('/api/signals', SignalsResponseSchema, signal);
 }
 
+export async function fetchMarketStatus(
+  signal?: AbortSignal
+): Promise<EndpointCheckResult<MarketStatusResponse>> {
+  return fetchValidatedJson(
+    '/api/market/status',
+    MarketStatusResponseSchema,
+    signal
+  );
+}
+
+export async function fetchMarketCandles(
+  signal?: AbortSignal
+): Promise<EndpointCheckResult<MarketCandlesResponse>> {
+  return fetchValidatedJson(
+    '/api/market/candles?instrument=XAUUSD&granularity=M15&limit=100',
+    MarketCandlesResponseSchema,
+    signal
+  );
+}
+
+export async function fetchMarketSession(
+  signal?: AbortSignal
+): Promise<EndpointCheckResult<MarketSessionResponse>> {
+  return fetchValidatedJson(
+    '/api/market/session',
+    MarketSessionResponseSchema,
+    signal
+  );
+}
+
 export async function fetchAllDiagnostics(
   signal?: AbortSignal
 ): Promise<DiagnosticsSnapshot> {
-  const [health, systemStatus, instruments, signals] = await Promise.all([
+  const [
+    health,
+    systemStatus,
+    instruments,
+    signals,
+    marketStatus,
+    marketCandles,
+    marketSession,
+  ] = await Promise.all([
     fetchHealth(signal),
     fetchSystemStatus(signal),
     fetchInstruments(signal),
     fetchSignals(signal),
+    fetchMarketStatus(signal),
+    fetchMarketCandles(signal),
+    fetchMarketSession(signal),
   ]);
 
   return {
@@ -134,5 +184,8 @@ export async function fetchAllDiagnostics(
     systemStatus,
     instruments,
     signals,
+    marketStatus,
+    marketCandles,
+    marketSession,
   };
 }

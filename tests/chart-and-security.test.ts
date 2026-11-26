@@ -204,11 +204,14 @@ test('frontend code imports no server secrets and no broker/order-execution rout
   assert.deepEqual(normalizedRoutes, [
     'health/route.ts',
     'instruments/route.ts',
+    'market/candles/route.ts',
+    'market/session/route.ts',
+    'market/status/route.ts',
     'signals/route.ts',
     'system/status/route.ts',
   ]);
 
-  const forbiddenRoutePattern = /(order|trade|broker|execute|wallet|payment|checkout)/i;
+  const forbiddenRoutePattern = /(order|trade|position|broker|execute|wallet|payment|checkout)/i;
   for (const route of normalizedRoutes) {
     assert.equal(
       forbiddenRoutePattern.test(route),
