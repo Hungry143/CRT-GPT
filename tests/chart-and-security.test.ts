@@ -202,6 +202,7 @@ test('frontend code imports no server secrets and no broker/order-execution rout
     .sort();
 
   assert.deepEqual(normalizedRoutes, [
+    'diagnostics/oanda-practice-smoke/route.ts',
     'health/route.ts',
     'instruments/route.ts',
     'market/candles/route.ts',
