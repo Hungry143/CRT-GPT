@@ -7,18 +7,25 @@ import { MarketStatusPanel } from '@/client/components/MarketStatusPanel';
 import { OpportunityRadarPanel } from '@/client/components/OpportunityRadarPanel';
 import { TimeframePanel } from '@/client/components/TimeframePanel';
 import { TradingViewChartPanel } from '@/client/components/TradingViewChartPanel';
+import { UniverseWatchlist } from '@/client/components/UniverseWatchlist';
+import type { InstrumentKey } from '@/shared/tradingSystem/universe';
 
 interface CommandCenterViewProps {
   diagnostics: DiagnosticsSnapshot;
   isLoading: boolean;
+  selectedInstrument: InstrumentKey;
+  onSelectInstrument: (instrument: InstrumentKey) => void;
+  chartSymbol: string;
 }
 
 export function CommandCenterView({
   diagnostics,
   isLoading,
+  selectedInstrument,
+  onSelectInstrument,
+  chartSymbol,
 }: CommandCenterViewProps) {
   const systemStatus = diagnostics.systemStatus.data;
-  const instrument = diagnostics.instruments.data?.data[0];
 
   return (
     <div className="space-y-6">
@@ -35,7 +42,7 @@ export function CommandCenterView({
             DATA SOURCE NOT CONNECTED
           </p>
           <p className="mt-1 text-[#CBD5E1]">
-            The embedded TradingView chart below is an independent third-party
+            The selected TradingView chart below is an independent third-party
             display widget only. Backend market-data ingestion, CRT analysis,
             and signal generation remain disabled until a verified provider is
             configured.
@@ -43,10 +50,10 @@ export function CommandCenterView({
         </div>
       </div>
 
-      <TradingViewChartPanel
-        symbol={instrument?.displayChartSymbol ?? 'OANDA:XAUUSD'}
-      />
+      <UniverseWatchlist selectedInstrument={selectedInstrument} onSelectInstrument={onSelectInstrument} />
+      <TradingViewChartPanel symbol={chartSymbol} />
 
+      {selectedInstrument === 'XAUUSD' ? (
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-stretch">
         <MarketStatusPanel
           systemStatus={systemStatus}
@@ -60,12 +67,13 @@ export function CommandCenterView({
         marketStatus={diagnostics.marketStatus.data}
         marketSession={diagnostics.marketSession.data}
       />
+      ) : (
+        <section className="rounded-lg border border-[#222D3D] bg-[#111720] p-5 text-sm text-[#94A3B8]">{selectedInstrument} backend market data and CRT signals are not yet verified. No XAUUSD feed metrics are reused for another pair. TradingView remains visual-only.</section>
+      )}
 
-      <OpportunityRadarPanel
-        signalsResponse={diagnostics.signals.data}
-        systemStatus={systemStatus}
-        compact
-      />
+      {selectedInstrument === 'XAUUSD' ? (
+        <OpportunityRadarPanel signalsResponse={diagnostics.signals.data} systemStatus={systemStatus} compact />
+      ) : null}
     </div>
   );
 }

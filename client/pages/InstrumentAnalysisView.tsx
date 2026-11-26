@@ -5,19 +5,28 @@ import type { DiagnosticsSnapshot } from '@/client/services/apiClient';
 import { TimeframePanel } from '@/client/components/TimeframePanel';
 import { TradingViewChartPanel } from '@/client/components/TradingViewChartPanel';
 import { NO_DATA_DASH } from '@/shared/utils/display';
+import { UniverseWatchlist } from '@/client/components/UniverseWatchlist';
+import { getUniverseInstrument, type InstrumentKey } from '@/shared/tradingSystem/universe';
 
 interface InstrumentAnalysisViewProps {
   diagnostics: DiagnosticsSnapshot;
+  selectedInstrument: InstrumentKey;
+  onSelectInstrument: (instrument: InstrumentKey) => void;
+  chartSymbol: string;
 }
 
 export function InstrumentAnalysisView({
   diagnostics,
+  selectedInstrument,
+  onSelectInstrument,
+  chartSymbol,
 }: InstrumentAnalysisViewProps) {
-  const instrument = diagnostics.instruments.data?.data[0] ?? null;
+  const selected = getUniverseInstrument(selectedInstrument);
   const error = diagnostics.instruments.error;
 
   return (
     <div className="space-y-6">
+      <UniverseWatchlist selectedInstrument={selectedInstrument} onSelectInstrument={onSelectInstrument} />
       <section
         aria-labelledby="instrument-profile-heading"
         className="bg-[#111720] border border-[#222D3D] rounded-lg overflow-hidden"
@@ -28,11 +37,10 @@ export function InstrumentAnalysisView({
               id="instrument-profile-heading"
               className="font-display text-base font-semibold text-[#F8FAFC]"
             >
-              XAUUSD Configuration Profile
+              {selectedInstrument} Configuration Profile
             </h2>
             <p className="text-xs text-[#8B9BB0] mt-0.5">
-              Configuration-only registry record — no quotes, spreads, or
-              derived pricing in Stage 1
+              Configuration-only registry record — no verified backend OHLC, quotes, spreads, or derived pricing
             </p>
           </div>
           <span className="font-mono text-xs text-amber-300">
@@ -62,29 +70,25 @@ export function InstrumentAnalysisView({
               <div className="py-2 flex items-center justify-between gap-4">
                 <dt className="text-[#8B9BB0]">Instrument Key</dt>
                 <dd className="font-mono font-semibold text-amber-400">
-                  {instrument?.key ?? 'XAUUSD'}
+                  {selectedInstrument}
                 </dd>
               </div>
               <div className="py-2 flex items-center justify-between gap-4">
                 <dt className="text-[#8B9BB0]">Description</dt>
                 <dd className="text-[#E2E8F0] text-right">
-                  {instrument?.displayName ?? 'Gold / US Dollar (Spot Reference)'}
+                  {selected.displayName}
                 </dd>
               </div>
               <div className="py-2 flex items-center justify-between gap-4">
                 <dt className="text-[#8B9BB0]">Enabled in Registry</dt>
                 <dd className="font-mono text-[#E2E8F0]">
-                  {instrument ? (instrument.enabled ? 'true' : 'false') : 'true'}
+                  true
                 </dd>
               </div>
               <div className="py-2 flex items-center justify-between gap-4">
                 <dt className="text-[#8B9BB0]">Market Data Connected</dt>
                 <dd className="font-mono text-amber-300">
-                  {instrument
-                    ? instrument.marketDataConnected
-                      ? 'true'
-                      : 'false'
-                    : 'false'}
+                  false
                 </dd>
               </div>
             </dl>
@@ -93,19 +97,19 @@ export function InstrumentAnalysisView({
               <div className="py-2 flex items-center justify-between gap-4">
                 <dt className="text-[#8B9BB0]">Backend Feed Symbol</dt>
                 <dd className="font-mono text-[#94A3B8]">
-                  {instrument?.backendFeedSymbol ?? NO_DATA_DASH}
+                  {NO_DATA_DASH}
                 </dd>
               </div>
               <div className="py-2 flex items-center justify-between gap-4">
                 <dt className="text-[#8B9BB0]">Display Chart Symbol</dt>
                 <dd className="font-mono text-[#E2E8F0]">
-                  {instrument?.displayChartSymbol ?? 'OANDA:XAUUSD'}
+                  {chartSymbol}
                 </dd>
               </div>
               <div className="py-2 flex items-center justify-between gap-4">
                 <dt className="text-[#8B9BB0]">Active Timeframes</dt>
                 <dd className="font-mono text-[#E2E8F0]">
-                  {instrument?.supportedTimeframes.join(', ') ?? 'D1, H4, H1, M15'}
+                  {selected.configuredTimeframes.join(', ')}
                 </dd>
               </div>
               <div className="py-2 flex items-center justify-between gap-4">
@@ -117,16 +121,17 @@ export function InstrumentAnalysisView({
         )}
 
         <div className="px-5 py-3 border-t border-[#1F2937] bg-[#0E131B] text-[11px] text-[#8B9BB0]">
-          {instrument?.displayChartNote ??
-            'OANDA:XAUUSD is a TradingView chart display selection only and does not assert or connect a backend market-data provider.'}
+          {`${chartSymbol} is a visual-only selection. It does not assert or connect a verified backend market-data provider.`}
         </div>
       </section>
 
-      <TradingViewChartPanel
-        symbol={instrument?.displayChartSymbol ?? 'OANDA:XAUUSD'}
-      />
+      <TradingViewChartPanel symbol={chartSymbol} />
 
-      <TimeframePanel systemStatus={diagnostics.systemStatus.data} />
+      {selectedInstrument === 'XAUUSD' ? (
+        <TimeframePanel systemStatus={diagnostics.systemStatus.data} />
+      ) : (
+        <section className="rounded-lg border border-[#222D3D] bg-[#111720] p-5 text-sm text-[#8B9BB0]">Per-instrument HTF/LTF analysis is unavailable until verified backend candles and CRT rules are connected for {selectedInstrument}. The XAUUSD-only diagnostic feed is not reused.</section>
+      )}
     </div>
   );
 }

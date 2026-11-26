@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { INSTRUMENT_KEYS } from '../shared/tradingSystem/universe';
 import assert from 'node:assert/strict';
 import { GET as getHealth } from '../app/api/health/route';
 import { GET as getSystemStatus } from '../app/api/system/status/route';
@@ -53,15 +54,16 @@ test('GET /api/system/status defaults strictly to NOT_CONFIGURED, DISABLED, RESE
   assert.equal(parsed.orderExecutionEnabled, false);
 });
 
-test('GET /api/instruments returns exactly one XAUUSD config-only instrument with no price fields', async () => {
+test('GET /api/instruments returns all 14 configuration-only instruments with no invented prices', async () => {
   const res = await getInstruments();
   assert.equal(res.status, 200);
 
   const body = await res.json();
   const parsed = InstrumentsResponseSchema.parse(body);
 
-  assert.equal(parsed.data.length, 1);
-  const [xau] = parsed.data;
+  assert.equal(parsed.data.length, 14);
+  assert.deepEqual(parsed.data.map(x => x.key), [...INSTRUMENT_KEYS]);
+  const xau = parsed.data.find(x => x.key === 'XAUUSD')!;
   assert.equal(xau.key, 'XAUUSD');
   assert.equal(xau.enabled, true);
   assert.equal(xau.marketDataConnected, false);
@@ -69,8 +71,11 @@ test('GET /api/instruments returns exactly one XAUUSD config-only instrument wit
   assert.equal(xau.displayChartSymbol, 'OANDA:XAUUSD');
 
   const forbiddenPriceKeys = ['price', 'bid', 'ask', 'last', 'close', 'open', 'spread', 'change'];
-  for (const key of forbiddenPriceKeys) {
-    assert.equal(key in xau, false, `instrument must not expose fabricated field "${key}"`);
+  for (const instrument of parsed.data) {
+    assert.equal(instrument.marketDataConnected, false);
+    for (const key of forbiddenPriceKeys) {
+      assert.equal(key in instrument, false, `instrument ${instrument.key} must not expose fabricated field "${key}"`);
+    }
   }
 });
 

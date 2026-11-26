@@ -95,9 +95,9 @@ export function SidebarNav({
 
       <div className="px-5 py-3 border-b border-[#1F2937]">
         <div className="flex items-center justify-between text-xs">
-          <span className="text-[#8B9BB0]">Active Instrument</span>
+          <span className="text-[#8B9BB0]">Instrument Universe</span>
           <span className="font-mono font-medium text-amber-400 tabular-nums">
-            XAUUSD
+            14 markets
           </span>
         </div>
         <p className="mt-1 text-[11px] leading-relaxed text-[#64748B]">
@@ -136,7 +136,7 @@ export function SidebarNav({
       <div className="px-5 py-4 border-t border-[#1F2937] text-xs text-[#64748B] space-y-1">
         <div className="flex items-center justify-between">
           <span>Milestone</span>
-          <span className="font-mono text-[#94A3B8]">Stage 1</span>
+          <span className="font-mono text-[#94A3B8]">Platform build</span>
         </div>
         <div className="flex items-center justify-between">
           <span>Order Execution</span>

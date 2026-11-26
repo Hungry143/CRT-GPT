@@ -14,6 +14,7 @@ import {
   MARKET_REFERENCE_TIMEZONE,
 } from '@/shared/utils/time';
 import { NAV_ITEMS, type NavSectionId } from '@/client/components/SidebarNav';
+import type { InstrumentKey } from '@/shared/tradingSystem/universe';
 
 interface TopStatusBarProps {
   activeSection: NavSectionId;
@@ -23,6 +24,7 @@ interface TopStatusBarProps {
   isRefreshing: boolean;
   onRefresh: () => void;
   onOpenMobileNav: () => void;
+  selectedInstrument: InstrumentKey;
 }
 
 export function TopStatusBar({
@@ -33,6 +35,7 @@ export function TopStatusBar({
   isRefreshing,
   onRefresh,
   onOpenMobileNav,
+  selectedInstrument,
 }: TopStatusBarProps) {
   const [clockInstant, setClockInstant] = useState<string>(initialServerTimeUtc);
 
@@ -113,7 +116,7 @@ export function TopStatusBar({
           <div className="flex items-center gap-1.5 whitespace-nowrap">
             <span className="text-[#8B9BB0]">Instrument</span>
             <span className="font-mono font-semibold text-amber-400">
-              XAUUSD
+              {selectedInstrument}
             </span>
           </div>
         </div>

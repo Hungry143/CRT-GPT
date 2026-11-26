@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { InstrumentKeySchema } from '@/shared/tradingSystem/universe';
 
 /**
  * Shared Stage 1 & Future-Extensible API Contracts for CRT Intelligence.
@@ -99,7 +100,7 @@ export type RuleEvidence = z.infer<typeof RuleEvidenceSchema>;
  */
 export const SignalSchema = z.object({
   id: z.string(),
-  instrument: z.literal('XAUUSD'),
+  instrument: InstrumentKeySchema,
   state: SignalStateSchema,
   direction: z.enum(['LONG', 'SHORT']).nullable(),
   htfTimeframe: z.enum(['D1', 'H4']),
@@ -117,9 +118,9 @@ export type Signal = z.infer<typeof SignalSchema>;
  */
 export const InstrumentConfigSchema = z
   .object({
-    key: z.literal('XAUUSD'),
+    key: InstrumentKeySchema,
     displayName: z.string(),
-    assetClass: z.literal('PRECIOUS_METALS'),
+    assetClass: z.enum(['FOREX', 'PRECIOUS_METALS']),
     enabled: z.boolean(),
     marketDataConnected: z.boolean(),
     backendFeedSymbol: z.string().nullable(),

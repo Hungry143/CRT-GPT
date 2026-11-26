@@ -193,7 +193,7 @@ export function TradingViewChartPanel({
           </button>
 
           <a
-            href={TRADINGVIEW_EXTERNAL_CHART_URL}
+            href={`https://www.tradingview.com/chart/?symbol=${encodeURIComponent(symbol)}`}
             target="_blank"
             rel="noopener noreferrer"
             className="inline-flex h-8 items-center gap-1.5 px-3 rounded-md border border-[#222D3D] bg-[#0B0F14] text-xs font-medium text-[#CBD5E1] hover:bg-[#18212E] hover:text-[#F8FAFC] transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-amber-500"
