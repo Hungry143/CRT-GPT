@@ -479,9 +479,17 @@ export class OandaV20MarketDataAdapter implements MarketDataAdapter {
 
     const nowUtc = this.nowFn().toISOString();
     this.lastSuccessfulRequestUtc = nowUtc;
-    this.state = 'CONNECTED';
-    this.reasonCode = null;
-    this.warnings = [];
+    if (this.lastCompleteCandleCloseUtc === null) {
+      this.state = 'CONNECTING';
+      this.reasonCode = 'AWAITING_COMPLETED_CANDLES';
+      this.warnings = [
+        'Provider instrument verified, but no completed candles have been synchronized yet.',
+      ];
+    } else {
+      this.state = 'CONNECTED';
+      this.reasonCode = null;
+      this.warnings = [];
+    }
     this.verifiedInstrument = {
       displaySymbol: 'XAUUSD',
       providerName: 'oanda_v20',
@@ -501,7 +509,7 @@ export class OandaV20MarketDataAdapter implements MarketDataAdapter {
       verified: true,
       state: this.state,
       instrument: this.verifiedInstrument,
-      reasonCode: null,
+      reasonCode: this.reasonCode,
     };
   }
 
@@ -637,7 +645,8 @@ export class OandaV20MarketDataAdapter implements MarketDataAdapter {
         this.state = integrity.state;
         this.reasonCode = integrity.reasonCode;
         const canPreserveValidHistory =
-          integrity.reasonCode === 'UNEXPECTED_BAR_GAP' &&
+          (integrity.reasonCode === 'UNEXPECTED_BAR_GAP' ||
+            integrity.reasonCode === 'FEED_DATA_STALE') &&
           validation.duplicateBarCount === 0 &&
           validation.accepted.length > 0;
         return {

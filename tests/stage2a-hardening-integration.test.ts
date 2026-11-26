@@ -97,6 +97,9 @@ function createStatefulFakePgExecutor() {
           volume,
           complete,
           source_retrieved_at_utc,
+          config_identity_hash,
+          provider_env,
+          account_scope_hash,
         ] = params;
         candles.set(String(source_candle_id), {
           source_candle_id,
@@ -113,6 +116,9 @@ function createStatefulFakePgExecutor() {
           volume,
           complete,
           source_retrieved_at_utc,
+          config_identity_hash: config_identity_hash ?? 'legacy_unscoped',
+          provider_env: provider_env ?? null,
+          account_scope_hash: account_scope_hash ?? null,
         });
         return { rows: [] };
       }
@@ -120,10 +126,16 @@ function createStatefulFakePgExecutor() {
       if (normalized.includes('FROM normalized_candles WHERE complete = TRUE')) {
         const granularity = String(params[0]);
         const limit = Number(params[1]);
+        const configIdMatch = /AND config_identity_hash = \$(\d+)/.exec(normalized);
         const providerMatch = /AND provider = \$(\d+)/.exec(normalized);
+        const envMatch = /AND provider_env = \$(\d+)/.exec(normalized);
+        const acctMatch = /AND account_scope_hash = \$(\d+)/.exec(normalized);
         const symbolMatch = /AND provider_symbol = \$(\d+)/.exec(normalized);
         const basisMatch = /AND price_basis = \$(\d+)/.exec(normalized);
+        const configId = configIdMatch ? String(params[Number(configIdMatch[1]) - 1]) : null;
         const provider = providerMatch ? String(params[Number(providerMatch[1]) - 1]) : null;
+        const providerEnv = envMatch ? String(params[Number(envMatch[1]) - 1]) : null;
+        const accountScopeHash = acctMatch ? String(params[Number(acctMatch[1]) - 1]) : null;
         const providerSymbol = symbolMatch ? String(params[Number(symbolMatch[1]) - 1]) : null;
         const priceBasis = basisMatch ? String(params[Number(basisMatch[1]) - 1]) : null;
 
@@ -132,7 +144,10 @@ function createStatefulFakePgExecutor() {
             (r) =>
               r.complete === true &&
               r.granularity === granularity &&
+              (!configId || r.config_identity_hash === configId) &&
               (!provider || r.provider === provider) &&
+              (!providerEnv || r.provider_env === providerEnv) &&
+              (!accountScopeHash || r.account_scope_hash === accountScopeHash) &&
               (!providerSymbol || r.provider_symbol === providerSymbol) &&
               (!priceBasis || r.price_basis === priceBasis)
           )
@@ -152,6 +167,7 @@ function createStatefulFakePgExecutor() {
           changed_fields: params[2],
           previous_close: params[3],
           revised_close: params[4],
+          config_identity_hash: params[5] ?? 'legacy_unscoped',
         });
         return { rows: [] };
       }
@@ -179,6 +195,8 @@ function createStatefulFakePgExecutor() {
           reason_code: params[14],
           warnings: params[15],
           updated_at_utc: params[16],
+          provider_env: params[17] ?? null,
+          account_scope_hash: params[18] ?? null,
         });
         return { rows: [] };
       }
@@ -239,6 +257,7 @@ test('PostgreSQL migrations, persistent status, checkpoints, and revisions survi
   assert.deepEqual(mig1.appliedVersions, [
     '001_stage2a_market_data',
     '002_checkpoint_identity',
+    '003_candle_config_identity',
   ]);
   assert.deepEqual(mig1.skippedVersions, []);
 
@@ -247,6 +266,7 @@ test('PostgreSQL migrations, persistent status, checkpoints, and revisions survi
   assert.deepEqual(mig2.skippedVersions, [
     '001_stage2a_market_data',
     '002_checkpoint_identity',
+    '003_candle_config_identity',
   ]);
 
   // 2. Store #1 writes candles, revision, and feed checkpoint
@@ -468,19 +488,30 @@ test('stale, gapped, and corrupted candle series FAIL CLOSED on adapter and /api
   assert.equal(okFetch.status, 'CONNECTED');
   assert.equal(okFetch.candles.length, 3);
 
+  const runtimeConfigIdentity = buildFeedConfigIdentity({
+    provider: 'oanda_v20',
+    providerEnv: 'practice',
+    accountId: '101-001-1234567-001',
+    providerSymbol: 'XAU_USD',
+    priceBasis: healthyAdapter.alignmentPolicy.priceBasis,
+    policyVersion: healthyAdapter.alignmentPolicy.policyVersion,
+  });
+  const runtimeScope = {
+    configIdentityHash: runtimeConfigIdentity.configIdentityHash,
+    providerEnv: runtimeConfigIdentity.providerEnv,
+    accountScopeHash: runtimeConfigIdentity.accountScopeHash,
+  };
+
   const store = new InMemoryCandleStore();
-  await store.upsertCandles(okFetch.candles);
+  await store.upsertCandles(
+    okFetch.candles,
+    '2026-06-15T10:50:00.000Z',
+    runtimeScope
+  );
 
   const runtime: MarketDataRuntime = {
     fingerprint: 'test-fail-closed',
-    configIdentity: buildFeedConfigIdentity({
-      provider: 'oanda_v20',
-      providerEnv: 'practice',
-      accountId: '101-001-1234567-001',
-      providerSymbol: 'XAU_USD',
-      priceBasis: healthyAdapter.alignmentPolicy.priceBasis,
-      policyVersion: healthyAdapter.alignmentPolicy.policyVersion,
-    }),
+    configIdentity: runtimeConfigIdentity,
     closurePolicy: null,
     adapter: healthyAdapter,
     store,
@@ -511,7 +542,11 @@ test('stale, gapped, and corrupted candle series FAIL CLOSED on adapter and /api
 
   // Gapped store (drop middle bar) -> FAILS CLOSED even when timestamp is fresh!
   const gappedStore = new InMemoryCandleStore();
-  await gappedStore.upsertCandles([contiguousBars[0], contiguousBars[2]]);
+  await gappedStore.upsertCandles(
+    [contiguousBars[0], contiguousBars[2]],
+    '2026-06-15T10:50:00.000Z',
+    runtimeScope
+  );
   const gappedRes = await buildMarketCandlesPayload(
     { instrument: 'XAUUSD', granularity: 'M15', limit: 10 },
     new Date('2026-06-15T10:50:00.000Z'),
@@ -523,6 +558,7 @@ test('stale, gapped, and corrupted candle series FAIL CLOSED on adapter and /api
   assert.deepEqual(gappedRes.data, []);
 
   // Verified weekend closure does NOT falsely fail closed when schedule confirms closure
+  // and completed Friday bars have been synchronized
   const verifiedSchedule = createVerifiedFxMetalSchedule(['2026-12-25']);
   const fridayLastH1 = buildSyntheticClosedCandles({
     startOpenTimeUtc: '2026-06-19T20:00:00.000Z',
@@ -533,7 +569,11 @@ test('stale, gapped, and corrupted candle series FAIL CLOSED on adapter and /api
     retrievedAtUtc: '2026-06-20T12:00:00.000Z',
   });
   const weekendStore = new InMemoryCandleStore();
-  await weekendStore.upsertCandles(fridayLastH1);
+  await weekendStore.upsertCandles(
+    fridayLastH1,
+    '2026-06-20T12:00:00.000Z',
+    runtimeScope
+  );
   const weekendAdapter = new OandaV20MarketDataAdapter(
     {
       env: 'practice',
@@ -562,7 +602,11 @@ test('stale, gapped, and corrupted candle series FAIL CLOSED on adapter and /api
       },
     }
   );
-  await weekendAdapter.verifyInstrument();
+  const weekendSync = await weekendAdapter.fetchCompletedCandles({
+    granularity: 'H1',
+    limit: 10,
+  });
+  assert.equal(weekendSync.status, 'MARKET_CLOSED');
   const weekendRes = await buildMarketCandlesPayload(
     { instrument: 'XAUUSD', granularity: 'H1', limit: 10 },
     new Date('2026-06-20T12:00:00.000Z'),

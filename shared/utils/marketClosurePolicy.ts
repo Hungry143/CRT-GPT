@@ -32,6 +32,62 @@ export interface ExplicitUtcClosureWindow {
   label: string;
 }
 
+/**
+ * Explicit verification metadata proving a schedule was confirmed for a specific
+ * provider, regulatory division, and instrument rather than assumed globally.
+ */
+export interface ScheduleVerificationProvenance {
+  provider: string;
+  division: string;
+  instrument: string;
+  verifiedBy: string;
+  verifiedSource: string;
+  verifiedAtUtc: string;
+}
+
+export interface ScheduleScopeTarget {
+  provider: string;
+  division: string | null;
+  instrument: string;
+}
+
+/**
+ * Major spot-metals holiday / early-close ambiguity dates (America/New_York calendar dates)
+ * whose exact trading hours vary materially across liquidity providers and OANDA divisions
+ * (including US Thanksgiving Nov 26, 2026 and Day After Thanksgiving Nov 27, 2026).
+ *
+ * Any watch date NOT explicitly verified in a provider/division/instrument schedule
+ * MUST classify as `UNKNOWN` and fail closed rather than guessing open or closed hours.
+ */
+export const UNVERIFIED_HOLIDAY_WATCH_DATES_NY: readonly string[] = [
+  '2026-01-01', // New Year's Day
+  '2026-01-19', // MLK Jr. Day (early close varies by provider/division)
+  '2026-02-16', // Presidents' Day (early close varies by provider/division)
+  '2026-04-03', // Good Friday
+  '2026-05-25', // Memorial Day (early close varies by provider/division)
+  '2026-06-19', // Juneteenth (early close varies by provider/division)
+  '2026-07-03', // US Independence Day Observed
+  '2026-09-07', // Labor Day (early close varies by provider/division)
+  '2026-11-26', // US Thanksgiving Day (provider/division early-close hours differ)
+  '2026-11-27', // Day After Thanksgiving / Black Friday (provider/division early-close hours differ)
+  '2026-12-24', // Christmas Eve
+  '2026-12-25', // Christmas Day
+  '2026-12-31', // New Year's Eve
+  '2027-01-01', // New Year's Day
+  '2027-01-18', // MLK Jr. Day
+  '2027-02-15', // Presidents' Day
+  '2027-03-26', // Good Friday
+  '2027-05-31', // Memorial Day
+  '2027-06-18', // Juneteenth Observed
+  '2027-07-05', // US Independence Day Observed
+  '2027-09-06', // Labor Day
+  '2027-11-25', // US Thanksgiving Day
+  '2027-11-26', // Day After Thanksgiving
+  '2027-12-24', // Christmas Eve
+  '2027-12-25', // Christmas Day
+  '2027-12-31', // New Year's Eve
+] as const;
+
 export interface MarketClosurePolicyConfig {
   scheduleId: string;
   /**
@@ -41,10 +97,26 @@ export interface MarketClosurePolicyConfig {
    */
   effectiveFromNyDate: string;
   effectiveToNyDate: string;
-  /** Full-day market holidays in NY calendar dates (YYYY-MM-DD) */
+  /** Full-day market holidays explicitly verified for this schedule (YYYY-MM-DD in NY time) */
   fullDayHolidaysNy: readonly string[];
-  /** Special early-close or late-open sessions in NY time */
+  /** Special early-close or late-open sessions explicitly verified for this schedule in NY time */
   specialSessions?: readonly SpecialTradingSessionRule[];
+  /**
+   * Holiday watch dates explicitly verified to run regular (unmodified) trading hours
+   * for this provider/division/instrument.
+   */
+  explicitlyVerifiedNormalTradingDatesNy?: readonly string[];
+  /**
+   * Holiday/special-hour watch dates that MUST classify as `UNKNOWN` unless explicitly
+   * verified in `fullDayHolidaysNy`, `specialSessions`, or `explicitlyVerifiedNormalTradingDatesNy`.
+   * Defaults to `UNVERIFIED_HOLIDAY_WATCH_DATES_NY`.
+   */
+  unverifiedWatchDatesNy?: readonly string[];
+  /**
+   * Whether standard spot FX/metals weekend closures (Fri 17:00 NY -> Sun 17:00 NY)
+   * have been explicitly verified for this provider/division/instrument. Defaults to `true`.
+   */
+  weekendClosureVerified?: boolean;
   /** Optional daily maintenance break in NY local time (Mon–Thu), e.g. 17:00–18:00 NY */
   dailyMaintenanceWindowNy?: {
     start: NyTimeOfDay;
@@ -53,6 +125,13 @@ export interface MarketClosurePolicyConfig {
   } | null;
   /** Optional explicit UTC closure intervals (e.g. verified exchange/provider halt windows) */
   explicitClosuresUtc?: readonly ExplicitUtcClosureWindow[];
+  /** Optional verification provenance metadata */
+  provenance?: ScheduleVerificationProvenance;
+}
+
+export interface VerifiedProviderScheduleConfig
+  extends MarketClosurePolicyConfig {
+  provenance: ScheduleVerificationProvenance;
 }
 
 export interface MarketClosureInspection {
@@ -61,12 +140,20 @@ export interface MarketClosureInspection {
   nyDate: string;
   reason: string;
   ruleLabel: string | null;
+  provenance: ScheduleVerificationProvenance | null;
 }
 
 export interface AuthoritativeMarketClosurePolicy
   extends VerifiedMarketSchedule {
   readonly config: MarketClosurePolicyConfig;
+  readonly provenance: ScheduleVerificationProvenance | null;
   inspectInstant(utcDate: Date): MarketClosureInspection;
+}
+
+export interface VerifiedProviderMarketSchedule
+  extends AuthoritativeMarketClosurePolicy {
+  readonly provenance: ScheduleVerificationProvenance;
+  matchesScope(scope: ScheduleScopeTarget): boolean;
 }
 
 function toMinutesOfDay(hour: number, minute: number): number {
@@ -77,22 +164,63 @@ function formatYmd(year: number, month: number, day: number): string {
   return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
+function normalizeToken(value: string | null | undefined): string {
+  return (value ?? '').trim().toUpperCase();
+}
+
+function assertValidProvenance(provenance: ScheduleVerificationProvenance): void {
+  if (!provenance.provider.trim()) {
+    throw new Error('Verified schedule provenance requires a non-empty provider');
+  }
+  if (!provenance.division.trim()) {
+    throw new Error('Verified schedule provenance requires a non-empty division');
+  }
+  if (!provenance.instrument.trim()) {
+    throw new Error(
+      'Verified schedule provenance requires a non-empty instrument'
+    );
+  }
+  if (!provenance.verifiedBy.trim()) {
+    throw new Error(
+      'Verified schedule provenance requires a non-empty verifiedBy attribution'
+    );
+  }
+  if (!provenance.verifiedSource.trim()) {
+    throw new Error(
+      'Verified schedule provenance requires a non-empty verifiedSource reference'
+    );
+  }
+  if (Number.isNaN(Date.parse(provenance.verifiedAtUtc))) {
+    throw new Error(
+      'Verified schedule provenance requires a valid ISO-8601 verifiedAtUtc timestamp'
+    );
+  }
+}
+
 /**
- * Creates an authoritative, testable market-session closure policy covering:
+ * Creates a testable market-session closure policy covering:
  * - Verified coverage window (out-of-range dates return UNKNOWN and fail closed)
- * - Standard spot metals / FX weekend closure (Fri 17:00 NY -> Sun 17:00 NY)
- * - Full-day holidays (NY calendar dates)
- * - Special trading hours (early closes and late opens in NY local time)
+ * - Unverified holiday watch dates (including Nov 26-27, 2026) return UNKNOWN unless explicitly verified
+ * - Standard spot metals / FX weekend closure (Fri 17:00 NY -> Sun 17:00 NY) when verified
+ * - Explicitly verified full-day holidays and special trading hours in NY local time
  * - Optional daily maintenance breaks and explicit UTC closure windows
  */
 export function createMarketClosurePolicy(
   config: MarketClosurePolicyConfig
 ): AuthoritativeMarketClosurePolicy {
   const holidaySet = new Set(config.fullDayHolidaysNy);
+  const verifiedNormalSet = new Set(
+    config.explicitlyVerifiedNormalTradingDatesNy ?? []
+  );
+  const watchDateSet = new Set(
+    config.unverifiedWatchDatesNy ?? UNVERIFIED_HOLIDAY_WATCH_DATES_NY
+  );
   const specialByDate = new Map<string, SpecialTradingSessionRule>();
   for (const rule of config.specialSessions ?? []) {
     specialByDate.set(rule.nyDate, rule);
   }
+  const weekendClosureVerified = config.weekendClosureVerified ?? true;
+  const provenance = config.provenance ?? null;
 
   const parsedExplicitClosures = (config.explicitClosuresUtc ?? [])
     .map((w) => ({
@@ -114,7 +242,7 @@ export function createMarketClosurePolicy(
     const minuteOfDay = toMinutesOfDay(ny.hour, ny.minute);
     const instantMs = utcDate.getTime();
 
-    // Outside authoritative calendar coverage -> UNKNOWN (fails closed on staleness/gaps)
+    // Outside verified calendar coverage -> UNKNOWN (fails closed on staleness/gaps)
     if (ymd < config.effectiveFromNyDate || ymd > config.effectiveToNyDate) {
       return {
         state: 'UNKNOWN',
@@ -122,6 +250,7 @@ export function createMarketClosurePolicy(
         nyDate: ymd,
         reason: 'OUTSIDE_POLICY_COVERAGE_WINDOW',
         ruleLabel: null,
+        provenance,
       };
     }
 
@@ -134,6 +263,7 @@ export function createMarketClosurePolicy(
           nyDate: ymd,
           reason: 'EXPLICIT_UTC_CLOSURE',
           ruleLabel: closure.label,
+          provenance,
         };
       }
     }
@@ -144,12 +274,23 @@ export function createMarketClosurePolicy(
       (ny.weekday === 5 && ny.hour >= 17) ||
       (ny.weekday === 0 && ny.hour < 17)
     ) {
+      if (!weekendClosureVerified) {
+        return {
+          state: 'UNKNOWN',
+          scheduleId: config.scheduleId,
+          nyDate: ymd,
+          reason: 'UNVERIFIED_WEEKEND_HOURS',
+          ruleLabel: null,
+          provenance,
+        };
+      }
       return {
         state: 'WEEKEND_CLOSED',
         scheduleId: config.scheduleId,
         nyDate: ymd,
         reason: 'STANDARD_WEEKEND_CLOSURE',
         ruleLabel: 'Weekend closure (Fri 17:00 NY – Sun 17:00 NY)',
+        provenance,
       };
     }
 
@@ -160,11 +301,12 @@ export function createMarketClosurePolicy(
         scheduleId: config.scheduleId,
         nyDate: ymd,
         reason: 'VERIFIED_FULL_DAY_HOLIDAY',
-        ruleLabel: `Market holiday (${ymd})`,
+        ruleLabel: `Verified market holiday (${ymd})`,
+        provenance,
       };
     }
 
-    // Special trading hours (late open / early close)
+    // Explicitly verified special trading hours (late open / early close)
     const special = specialByDate.get(ymd);
     if (special) {
       if (special.lateOpenNy) {
@@ -179,6 +321,7 @@ export function createMarketClosurePolicy(
             nyDate: ymd,
             reason: 'SPECIAL_SESSION_LATE_OPEN',
             ruleLabel: special.label,
+            provenance,
           };
         }
       }
@@ -197,9 +340,20 @@ export function createMarketClosurePolicy(
             nyDate: ymd,
             reason: 'SPECIAL_SESSION_EARLY_CLOSE',
             ruleLabel: special.label,
+            provenance,
           };
         }
       }
+    } else if (watchDateSet.has(ymd) && !verifiedNormalSet.has(ymd)) {
+      // Unverified holiday/special-hours watch date -> MUST remain UNKNOWN and fail closed!
+      return {
+        state: 'UNKNOWN',
+        scheduleId: config.scheduleId,
+        nyDate: ymd,
+        reason: 'UNVERIFIED_HOLIDAY_HOURS',
+        ruleLabel: `Unverified holiday/special hours for ${ymd}; provider/division verification required`,
+        provenance,
+      };
     }
 
     // Optional daily maintenance break (Mon-Thu)
@@ -225,6 +379,7 @@ export function createMarketClosurePolicy(
           ruleLabel:
             config.dailyMaintenanceWindowNy.label ??
             'Daily NY rollover maintenance break',
+          provenance,
         };
       }
     }
@@ -235,12 +390,14 @@ export function createMarketClosurePolicy(
       nyDate: ymd,
       reason: 'REGULAR_TRADING_SESSION',
       ruleLabel: null,
+      provenance,
     };
   };
 
   return {
     scheduleId: config.scheduleId,
     config,
+    provenance,
     inspectInstant,
     classifyInstant(utcDate: Date): ExpectedMarketScheduleState {
       return inspectInstant(utcDate).state;
@@ -249,55 +406,62 @@ export function createMarketClosurePolicy(
 }
 
 /**
- * Authoritative 2026–2027 XAUUSD (spot gold) session closure policy anchored to America/New_York:
- * - Standard weekend closure: Fri 17:00 NY – Sun 17:00 NY
- * - Core global spot metals full-day closures (New Year's Day, Good Friday, Christmas Day)
- * - US holiday early-close special sessions (Independence Day observed, Thanksgiving, Christmas Eve, New Year's Eve)
- * - Dates outside 2026-01-01..2027-12-31 explicitly classify as UNKNOWN (fail closed)
+ * Creates an explicitly verified, provider-, division-, and instrument-specific schedule.
+ *
+ * Guarantees:
+ * - Requires explicit verification provenance (`provider`, `division`, `instrument`,
+ *   `verifiedBy`, `verifiedSource`, `verifiedAtUtc`).
+ * - Matches ONLY the exact `(provider, division, instrument)` scope.
+ * - Any unverified holiday watch date (including Nov 26–27, 2026) remains `UNKNOWN`
+ *   and fails closed unless explicitly verified for this exact provider, division, and instrument.
  */
-export function createAuthoritativeXauUsdClosurePolicy(
-  overrides: Partial<MarketClosurePolicyConfig> = {}
-): AuthoritativeMarketClosurePolicy {
-  return createMarketClosurePolicy({
-    scheduleId: 'xauusd-ny17-authoritative-2026-2027',
-    effectiveFromNyDate: '2026-01-01',
-    effectiveToNyDate: '2027-12-31',
-    fullDayHolidaysNy: [
-      '2026-01-01', // New Year's Day
-      '2026-04-03', // Good Friday
-      '2026-12-25', // Christmas Day
-      '2027-01-01', // New Year's Day
-      '2027-03-26', // Good Friday
-      '2027-12-25', // Christmas Day
-    ],
-    specialSessions: [
-      {
-        nyDate: '2026-07-03',
-        earlyCloseNy: { hour: 13, minute: 0 },
-        reopenNy: null, // Friday early close rolls directly into Fri 17:00 NY weekend closure
-        label: 'US Independence Day Observed Early Close (13:00 NY)',
-      },
-      {
-        nyDate: '2026-11-26',
-        earlyCloseNy: { hour: 13, minute: 0 },
-        reopenNy: { hour: 17, minute: 0 }, // Thursday reopens at 17:00 NY daily roll
-        label: 'US Thanksgiving Early Close (13:00 NY – 17:00 NY)',
-      },
-      {
-        nyDate: '2026-12-24',
-        earlyCloseNy: { hour: 13, minute: 30 },
-        reopenNy: null, // Stays closed into Christmas Day full-day holiday
-        label: 'Christmas Eve Early Close (13:30 NY)',
-      },
-      {
-        nyDate: '2026-12-31',
-        earlyCloseNy: { hour: 16, minute: 0 },
-        reopenNy: null, // Stays closed into New Year's Day full-day holiday
-        label: "New Year's Eve Early Close (16:00 NY)",
-      },
-    ],
-    dailyMaintenanceWindowNy: null,
-    explicitClosuresUtc: [],
-    ...overrides,
-  });
+export function createVerifiedProviderSchedule(
+  config: VerifiedProviderScheduleConfig
+): VerifiedProviderMarketSchedule {
+  assertValidProvenance(config.provenance);
+  const policy = createMarketClosurePolicy(config);
+
+  const expectedProvider = normalizeToken(config.provenance.provider);
+  const expectedDivision = normalizeToken(config.provenance.division);
+  const expectedInstrument = normalizeToken(config.provenance.instrument);
+
+  return {
+    ...policy,
+    provenance: config.provenance,
+    matchesScope(scope: ScheduleScopeTarget): boolean {
+      if (!scope.division || !scope.division.trim()) {
+        return false;
+      }
+      return (
+        normalizeToken(scope.provider) === expectedProvider &&
+        normalizeToken(scope.division) === expectedDivision &&
+        normalizeToken(scope.instrument) === expectedInstrument
+      );
+    },
+  };
 }
+
+/**
+ * Resolves a verified provider/division/instrument schedule ONLY when every scope field
+ * (`provider`, `division`, `instrument`) matches an explicitly verified schedule entry.
+ * Returns `null` when unverified so unknown hours remain `UNKNOWN` and fail closed.
+ */
+export function resolveVerifiedScheduleForScope(
+  schedules: readonly VerifiedProviderMarketSchedule[],
+  scope: ScheduleScopeTarget
+): VerifiedProviderMarketSchedule | null {
+  for (const schedule of schedules) {
+    if (schedule.matchesScope(scope)) {
+      return schedule;
+    }
+  }
+  return null;
+}
+
+/**
+ * Registered production provider/division/instrument verified schedules.
+ * Intentionally empty by default: holiday and special trading hours must NEVER be assumed
+ * globally and must only be registered after explicit provider/division bulletin verification.
+ */
+export const REGISTERED_VERIFIED_PROVIDER_SCHEDULES: readonly VerifiedProviderMarketSchedule[] =
+  [];

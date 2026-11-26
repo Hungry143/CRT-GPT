@@ -27,8 +27,8 @@ import { buildMarketCandlesPayload } from '../server/routes/marketCandles';
 import { buildMarketSessionPayload } from '../server/routes/marketSession';
 import { buildMarketStatusPayload } from '../server/routes/marketStatus';
 import {
-  createAuthoritativeXauUsdClosurePolicy,
   createMarketClosurePolicy,
+  createVerifiedProviderSchedule,
 } from '../shared/utils/marketClosurePolicy';
 import {
   buildSyntheticClosedCandles,
@@ -100,6 +100,9 @@ function createSharedPostgresMock() {
           volume: params[11],
           complete: params[12],
           source_retrieved_at_utc: params[13],
+          config_identity_hash: params[14] ?? 'legacy_unscoped',
+          provider_env: params[15] ?? null,
+          account_scope_hash: params[16] ?? null,
         });
         return { rows: [] };
       }
@@ -107,11 +110,23 @@ function createSharedPostgresMock() {
       if (normalized.includes('FROM normalized_candles WHERE complete = TRUE')) {
         const granularity = String(params[0]);
         const limit = Number(params[1]);
+        const configIdMatch = /AND config_identity_hash = \$(\d+)/.exec(normalized);
         const providerMatch = /AND provider = \$(\d+)/.exec(normalized);
+        const envMatch = /AND provider_env = \$(\d+)/.exec(normalized);
+        const acctMatch = /AND account_scope_hash = \$(\d+)/.exec(normalized);
         const symbolMatch = /AND provider_symbol = \$(\d+)/.exec(normalized);
         const basisMatch = /AND price_basis = \$(\d+)/.exec(normalized);
+        const configId = configIdMatch
+          ? String(params[Number(configIdMatch[1]) - 1])
+          : null;
         const provider = providerMatch
           ? String(params[Number(providerMatch[1]) - 1])
+          : null;
+        const providerEnv = envMatch
+          ? String(params[Number(envMatch[1]) - 1])
+          : null;
+        const accountScopeHash = acctMatch
+          ? String(params[Number(acctMatch[1]) - 1])
           : null;
         const providerSymbol = symbolMatch
           ? String(params[Number(symbolMatch[1]) - 1])
@@ -125,7 +140,10 @@ function createSharedPostgresMock() {
             (r) =>
               r.complete === true &&
               r.granularity === granularity &&
+              (!configId || r.config_identity_hash === configId) &&
               (!provider || r.provider === provider) &&
+              (!providerEnv || r.provider_env === providerEnv) &&
+              (!accountScopeHash || r.account_scope_hash === accountScopeHash) &&
               (!providerSymbol || r.provider_symbol === providerSymbol) &&
               (!priceBasis || r.price_basis === priceBasis)
           )
@@ -145,6 +163,7 @@ function createSharedPostgresMock() {
           changed_fields: params[2],
           previous_close: params[3],
           revised_close: params[4],
+          config_identity_hash: params[5] ?? 'legacy_unscoped',
         });
         return { rows: [] };
       }
@@ -172,6 +191,8 @@ function createSharedPostgresMock() {
           reason_code: params[14],
           warnings: params[15],
           updated_at_utc: params[16],
+          provider_env: params[17] ?? null,
+          account_scope_hash: params[18] ?? null,
         });
         return { rows: [] };
       }
@@ -192,10 +213,35 @@ function createSharedPostgresMock() {
   return { executor, candles, checkpoints, migrations };
 }
 
+function createTestVerifiedOandaUsSchedule() {
+  return createVerifiedProviderSchedule({
+    scheduleId: 'test-verified-oanda-us-xauusd-2026-2027',
+    provenance: {
+      provider: 'oanda_v20',
+      division: 'OANDA_US',
+      instrument: 'XAU_USD',
+      verifiedBy: 'stage2b-test-fixture',
+      verifiedSource: 'OANDA US metals holiday bulletin (test fixture)',
+      verifiedAtUtc: '2026-01-02T00:00:00.000Z',
+    },
+    effectiveFromNyDate: '2026-01-01',
+    effectiveToNyDate: '2027-12-31',
+    fullDayHolidaysNy: ['2026-01-01', '2026-04-03', '2026-12-25'],
+    specialSessions: [
+      {
+        nyDate: '2026-11-26',
+        earlyCloseNy: { hour: 13, minute: 0 },
+        reopenNy: { hour: 17, minute: 0 },
+        label: 'Verified OANDA US Thanksgiving Early Close (13:00–17:00 NY)',
+      },
+    ],
+  });
+}
+
 test('cross-process integration: standalone worker ingests XAUUSD candles and a separate fresh API runtime serves both /api/market/status and /api/market/candles', async () => {
   const sharedDb = createSharedPostgresMock();
   const dbUrl = 'postgresql://crt_worker:secret@127.0.0.1:5432/crt_shared';
-  const closurePolicy = createAuthoritativeXauUsdClosurePolicy();
+  const closurePolicy = createTestVerifiedOandaUsSchedule();
 
   // Monday 2026-06-15 10:00Z .. 10:45Z (open market, 3 completed M15 bars)
   const nowUtc = new Date('2026-06-15T10:50:00.000Z');
@@ -341,7 +387,7 @@ test('checkpoint identity isolation rejects stale checkpoints from different pro
   const sharedDb = createSharedPostgresMock();
   const dbUrl = 'postgresql://crt_worker:secret@127.0.0.1:5432/crt_shared';
   const nowUtc = new Date('2026-06-15T10:50:00.000Z');
-  const closurePolicy = createAuthoritativeXauUsdClosurePolicy();
+  const closurePolicy = createTestVerifiedOandaUsSchedule();
 
   const bars = buildSyntheticClosedCandles({
     startOpenTimeUtc: '2026-06-15T10:00:00.000Z',
@@ -352,14 +398,6 @@ test('checkpoint identity isolation rejects stale checkpoints from different pro
     retrievedAtUtc: nowUtc.toISOString(),
   });
 
-  // Seed DB + checkpoint under Practice Account A, MID price basis
-  const storeA = new PostgresCandleStore({
-    databaseUrl: dbUrl,
-    executor: sharedDb.executor,
-  });
-  await storeA.ensureReady();
-  await storeA.upsertCandles(bars, nowUtc.toISOString());
-
   const identityA = buildFeedConfigIdentity({
     provider: 'oanda_v20',
     providerEnv: 'practice',
@@ -367,6 +405,18 @@ test('checkpoint identity isolation rejects stale checkpoints from different pro
     providerSymbol: 'XAU_USD',
     priceBasis: 'MID',
     policyVersion: '2026.1-ny17-mid',
+  });
+
+  // Seed DB + checkpoint under Practice Account A, MID price basis
+  const storeA = new PostgresCandleStore({
+    databaseUrl: dbUrl,
+    executor: sharedDb.executor,
+  });
+  await storeA.ensureReady();
+  await storeA.upsertCandles(bars, nowUtc.toISOString(), {
+    configIdentityHash: identityA.configIdentityHash,
+    providerEnv: identityA.providerEnv,
+    accountScopeHash: identityA.accountScopeHash,
   });
 
   await storeA.saveFeedCheckpoint({
@@ -484,7 +534,7 @@ test('checkpoint identity isolation rejects stale checkpoints from different pro
 });
 
 test('authoritative market-session closure policy handles weekends, holidays, special hours, and fails closed on unknown closures without permanently rejecting valid history', async () => {
-  const policy = createAuthoritativeXauUsdClosurePolicy();
+  const policy = createTestVerifiedOandaUsSchedule();
 
   // 1. Weekend closure: Sat 2026-06-20 12:00 UTC
   assert.equal(
@@ -531,15 +581,6 @@ test('authoritative market-session closure policy handles weekends, holidays, sp
     retrievedAtUtc: '2026-11-26T23:10:00.000Z',
   })[0];
 
-  const sharedDb = createSharedPostgresMock();
-  const dbUrl = 'postgresql://crt_worker:secret@127.0.0.1:5432/crt_closure';
-  const store = new PostgresCandleStore({
-    databaseUrl: dbUrl,
-    executor: sharedDb.executor,
-  });
-  await store.ensureReady();
-  await store.upsertCandles([preEarlyClose, postEarlyClose]);
-
   const oandaConfig: OandaV20Config = {
     env: 'practice',
     accountId: '101-001-8888888-001',
@@ -554,6 +595,19 @@ test('authoritative market-session closure policy handles weekends, holidays, sp
     providerSymbol: 'XAU_USD',
     priceBasis: 'MID',
     policyVersion: '2026.1-ny17-mid',
+  });
+
+  const sharedDb = createSharedPostgresMock();
+  const dbUrl = 'postgresql://crt_worker:secret@127.0.0.1:5432/crt_closure';
+  const store = new PostgresCandleStore({
+    databaseUrl: dbUrl,
+    executor: sharedDb.executor,
+  });
+  await store.ensureReady();
+  await store.upsertCandles([preEarlyClose, postEarlyClose], '2026-11-26T23:10:00.000Z', {
+    configIdentityHash: identity.configIdentityHash,
+    providerEnv: identity.providerEnv,
+    accountScopeHash: identity.accountScopeHash,
   });
   await store.saveFeedCheckpoint({
     checkpointKey: 'XAUUSD:primary',
@@ -946,7 +1000,7 @@ test(
   { skip: !liveTestDbUrl },
   async () => {
     const executor = createManagedPgExecutor(liveTestDbUrl!);
-    const closurePolicy = createAuthoritativeXauUsdClosurePolicy();
+    const closurePolicy = createTestVerifiedOandaUsSchedule();
     const nowUtc = new Date('2026-06-15T10:50:00.000Z');
     const bars = buildSyntheticClosedCandles({
       startOpenTimeUtc: '2026-06-15T10:00:00.000Z',
@@ -980,11 +1034,17 @@ test(
         });
 
         await workerStore.ensureReady();
-        await workerStore.upsertCandles(bars, nowUtc.toISOString());
+        await workerStore.upsertCandles(bars, nowUtc.toISOString(), {
+          configIdentityHash: identity.configIdentityHash,
+          providerEnv: identity.providerEnv,
+          accountScopeHash: identity.accountScopeHash,
+        });
         await workerStore.saveFeedCheckpoint({
           checkpointKey: 'XAUUSD:primary',
           configIdentityHash: identity.configIdentityHash,
           provider: identity.provider,
+          providerEnv: identity.providerEnv,
+          accountScopeHash: identity.accountScopeHash,
           priceBasis: identity.priceBasis,
           policyVersion: identity.policyVersion,
           adapterName: 'OandaV20MarketDataAdapter',

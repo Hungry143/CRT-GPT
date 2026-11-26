@@ -150,13 +150,17 @@ export async function buildMarketCandlesPayload(
     });
   }
 
-  // Scope reads strictly to active provider, symbol, and price basis so candles from a prior
-  // configuration never leak across provider/account/price-basis switches
+  // Scope reads strictly to active feed configuration identity (provider, environment, division,
+  // account scope hash, symbol, price basis, and alignment policy) so candles never leak across
+  // accounts or environments sharing a database.
   const storedCandles = await runtime.store.getCompletedCandles({
+    configIdentityHash: effective.activeConfigIdentityHash,
     provider:
       effective.activeProvider && effective.activeProvider !== 'none'
         ? effective.activeProvider
         : undefined,
+    providerEnv: effective.activeProviderEnv,
+    accountScopeHash: effective.activeAccountScopeHash,
     providerSymbol: effective.activeProviderSymbol ?? undefined,
     priceBasis: effective.activePriceBasis,
     granularity: params.granularity,

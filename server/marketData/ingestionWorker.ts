@@ -217,6 +217,11 @@ export class MarketDataIngestionWorker {
     this.backfillService = new BackfillService({
       adapter: this.adapter,
       store: this.store,
+      storageScope: {
+        configIdentityHash: this.configIdentity.configIdentityHash,
+        providerEnv: this.configIdentity.providerEnv,
+        accountScopeHash: this.configIdentity.accountScopeHash,
+      },
       enabled: this.isLiveIngestionAllowed(),
       nowFn: this.nowFn,
     });
@@ -368,10 +373,13 @@ export class MarketDataIngestionWorker {
         }
 
         const latestStoredRows = await this.store.getCompletedCandles({
+          configIdentityHash: this.configIdentity.configIdentityHash,
           provider:
             this.configIdentity.provider !== 'none'
               ? this.configIdentity.provider
               : undefined,
+          providerEnv: this.configIdentity.providerEnv,
+          accountScopeHash: this.configIdentity.accountScopeHash,
           providerSymbol: this.configIdentity.providerSymbol ?? undefined,
           priceBasis: this.configIdentity.priceBasis,
           granularity,
@@ -500,6 +508,8 @@ export class MarketDataIngestionWorker {
       checkpointKey: this.checkpointKey,
       configIdentityHash: this.configIdentity.configIdentityHash,
       provider: this.configIdentity.provider,
+      providerEnv: this.configIdentity.providerEnv,
+      accountScopeHash: this.configIdentity.accountScopeHash,
       priceBasis: this.configIdentity.priceBasis,
       policyVersion: this.configIdentity.policyVersion,
       adapterName: adapterStatus.adapterName,

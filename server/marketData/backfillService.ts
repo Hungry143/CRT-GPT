@@ -3,7 +3,10 @@ import type {
   MarketGranularity,
 } from '@/shared/contracts/marketData';
 import type { MarketDataAdapter } from '@/server/marketData/adapter';
-import type { CandleStore } from '@/server/marketData/candleStore';
+import type {
+  CandleStorageScope,
+  CandleStore,
+} from '@/server/marketData/candleStore';
 import { OANDA_MAX_CANDLES_PER_REQUEST } from '@/server/marketData/oandaV20Adapter';
 
 export interface BackfillJobSpec {
@@ -52,17 +55,20 @@ export class BackfillService implements BackfillScheduler {
 
   private readonly adapter: MarketDataAdapter;
   private readonly store: CandleStore;
+  private readonly storageScope?: CandleStorageScope;
   private readonly enabled: boolean;
   private readonly nowFn: () => Date;
 
   constructor(options: {
     adapter: MarketDataAdapter;
     store: CandleStore;
+    storageScope?: CandleStorageScope;
     enabled?: boolean;
     nowFn?: () => Date;
   }) {
     this.adapter = options.adapter;
     this.store = options.store;
+    this.storageScope = options.storageScope;
     this.enabled = options.enabled ?? false;
     this.nowFn = options.nowFn ?? (() => new Date());
   }
@@ -174,7 +180,8 @@ export class BackfillService implements BackfillScheduler {
         if (recoverableHistorical.length > 0) {
           const upsert = await this.store.upsertCandles(
             recoverableHistorical,
-            this.nowFn().toISOString()
+            this.nowFn().toISOString(),
+            this.storageScope
           );
           insertedCount += upsert.inserted;
           unchangedCount += upsert.unchanged;
@@ -206,7 +213,8 @@ export class BackfillService implements BackfillScheduler {
       if (inRange.length > 0) {
         const upsert = await this.store.upsertCandles(
           inRange,
-          this.nowFn().toISOString()
+          this.nowFn().toISOString(),
+          this.storageScope
         );
         insertedCount += upsert.inserted;
         unchangedCount += upsert.unchanged;

@@ -23,6 +23,7 @@ export interface FeedConfigIdentity {
   readonly configIdentityHash: string;
   readonly provider: string;
   readonly providerEnv: string | null;
+  readonly providerDivision: string | null;
   readonly accountScopeHash: string | null;
   readonly providerSymbol: string | null;
   readonly priceBasis: PriceBasis;
@@ -32,6 +33,7 @@ export interface FeedConfigIdentity {
 export function buildFeedConfigIdentity(input: {
   provider: string;
   providerEnv?: string | null;
+  providerDivision?: string | null;
   accountId?: string | null;
   providerSymbol?: string | null;
   priceBasis: PriceBasis;
@@ -39,6 +41,7 @@ export function buildFeedConfigIdentity(input: {
 }): FeedConfigIdentity {
   const provider = input.provider.trim().toLowerCase() || 'none';
   const providerEnv = input.providerEnv?.trim().toLowerCase() || null;
+  const providerDivision = input.providerDivision?.trim().toUpperCase() || null;
   const accountScopeHash =
     input.accountId && input.accountId.trim().length > 0
       ? createHash('sha256')
@@ -51,6 +54,7 @@ export function buildFeedConfigIdentity(input: {
   const canonical = JSON.stringify({
     provider,
     providerEnv,
+    providerDivision,
     accountScopeHash,
     providerSymbol,
     priceBasis: input.priceBasis,
@@ -65,6 +69,7 @@ export function buildFeedConfigIdentity(input: {
     configIdentityHash,
     provider,
     providerEnv,
+    providerDivision,
     accountScopeHash,
     providerSymbol,
     priceBasis: input.priceBasis,
@@ -83,6 +88,20 @@ export function isCheckpointMatchingIdentity(
     return false;
   }
   if (checkpoint.provider && checkpoint.provider !== identity.provider) {
+    return false;
+  }
+  if (
+    checkpoint.providerEnv !== undefined &&
+    checkpoint.providerEnv !== null &&
+    checkpoint.providerEnv !== identity.providerEnv
+  ) {
+    return false;
+  }
+  if (
+    checkpoint.accountScopeHash !== undefined &&
+    checkpoint.accountScopeHash !== null &&
+    checkpoint.accountScopeHash !== identity.accountScopeHash
+  ) {
     return false;
   }
   if (checkpoint.priceBasis && checkpoint.priceBasis !== identity.priceBasis) {
@@ -112,7 +131,10 @@ export interface EffectiveFeedStatus {
   historyPersistence: HistoryPersistenceState;
   usedDurableCheckpoint: boolean;
   checkpointIdentityMismatch: boolean;
+  activeConfigIdentityHash: string;
   activeProvider: string;
+  activeProviderEnv: string | null;
+  activeAccountScopeHash: string | null;
   activeProviderSymbol: string | null;
   activePriceBasis: PriceBasis;
 }
@@ -173,7 +195,10 @@ export async function resolveEffectiveFeedStatus(
       usedDurableCheckpoint: overrides.usedDurableCheckpoint ?? false,
       checkpointIdentityMismatch:
         overrides.checkpointIdentityMismatch ?? false,
+      activeConfigIdentityHash: runtime.configIdentity.configIdentityHash,
       activeProvider: runtime.configIdentity.provider,
+      activeProviderEnv: runtime.configIdentity.providerEnv,
+      activeAccountScopeHash: runtime.configIdentity.accountScopeHash,
       activeProviderSymbol:
         (overrides.instrument !== undefined
           ? overrides.instrument

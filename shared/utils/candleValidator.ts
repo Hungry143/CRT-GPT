@@ -48,16 +48,38 @@ export interface CandleSeriesValidationResult {
 
 /**
  * Builds the deterministic bar identity key:
- * `(provider, providerSymbol, priceBasis, granularity, openTimeUtc)`.
+ * `(provider, providerSymbol, priceBasis, granularity, openTimeUtc)`,
+ * optionally prefixed by `configIdentityHash` to isolate persisted candles across
+ * provider environments, divisions, and account scopes.
  */
 export function buildDeterministicCandleKey(parts: {
+  configIdentityHash?: string;
   provider: string;
   providerSymbol: string;
   priceBasis: PriceBasis;
   granularity: MarketGranularity;
   openTimeUtc: string;
 }): string {
-  return `${parts.provider}:${parts.providerSymbol}:${parts.priceBasis}:${parts.granularity}:${parts.openTimeUtc}`;
+  const baseKey = `${parts.provider}:${parts.providerSymbol}:${parts.priceBasis}:${parts.granularity}:${parts.openTimeUtc}`;
+  return parts.configIdentityHash
+    ? `${parts.configIdentityHash}:${baseKey}`
+    : baseKey;
+}
+
+export function buildScopedCandleStorageKey(
+  configIdentityHash: string,
+  parts: {
+    provider: string;
+    providerSymbol: string;
+    priceBasis: PriceBasis;
+    granularity: MarketGranularity;
+    openTimeUtc: string;
+  }
+): string {
+  return buildDeterministicCandleKey({
+    ...parts,
+    configIdentityHash,
+  });
 }
 
 /**

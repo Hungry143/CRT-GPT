@@ -11,6 +11,7 @@
     "test": "npx --yes tsx --test tests/*.test.ts",
     "db:migrate": "npx --yes tsx scripts/migrate.ts",
     "worker:ingest": "npx --yes tsx scripts/ingestion-worker.ts",
+    "smoke:oanda-practice": "npx --yes tsx scripts/oanda-practice-smoke.ts",
     "clean": "next clean"
   },
   "dependencies": {

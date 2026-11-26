@@ -154,8 +154,22 @@ export function evaluateSeriesIntegrity(
   }
 
   const latest: NormalizedCandle | null = validation.accepted.at(-1) ?? null;
+  if (!latest) {
+    warnings.push(
+      `No completed ${options.granularity} candles are synchronized yet; feed cannot be reported as connected.`
+    );
+    return {
+      healthy: false,
+      failClosed: true,
+      state: 'CONNECTING',
+      reasonCode: 'AWAITING_COMPLETED_CANDLES',
+      freshnessSeconds: null,
+      warnings,
+    };
+  }
+
   const freshnessSeconds = computeFreshnessSeconds(
-    latest?.closeTimeUtc ?? null,
+    latest.closeTimeUtc,
     options.nowUtc
   );
 
@@ -226,6 +240,24 @@ export function evaluateFeedStatusFreshness(params: {
     params.nowUtc
   );
   const warnings = [...params.warnings];
+
+  if (
+    (params.currentState === 'CONNECTED' ||
+      params.currentState === 'MARKET_CLOSED') &&
+    freshnessSeconds === null
+  ) {
+    const awaitWarn =
+      'Provider verified without any synchronized completed candles; feed is awaiting completed bars.';
+    if (!warnings.includes(awaitWarn)) {
+      warnings.push(awaitWarn);
+    }
+    return {
+      state: 'CONNECTING',
+      freshnessSeconds: null,
+      reasonCode: 'AWAITING_COMPLETED_CANDLES',
+      warnings,
+    };
+  }
 
   if (params.currentState !== 'CONNECTED') {
     return {

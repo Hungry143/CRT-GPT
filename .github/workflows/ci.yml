@@ -62,16 +62,18 @@ jobs:
       - name: Run Stage 1 & Stage 2A test suite (zero-credential defaults)
         run: npm test
 
-      - name: Run PostgreSQL migration & cross-process integration tests
+      - name: Run PostgreSQL migration, cross-account & cross-process integration tests
         env:
           DATABASE_URL: "postgresql://crt_ci:crt_ci_password@127.0.0.1:5432/crt_stage2a_test"
           TEST_DATABASE_URL: "postgresql://crt_ci:crt_ci_password@127.0.0.1:5432/crt_stage2a_test"
         run: |
           npm run db:migrate
-          npx --yes tsx --test tests/stage2a-hardening-integration.test.ts tests/stage2a-final-integration.test.ts
+          npx --yes tsx --test tests/stage2a-hardening-integration.test.ts tests/stage2a-final-integration.test.ts tests/stage2b-preflight.test.ts
 
-      - name: Verify ingestion worker stays disabled by default
-        run: npm run worker:ingest
+      - name: Verify ingestion worker stays disabled and practice smoke skips cleanly by default
+        run: |
+          npm run worker:ingest
+          npm run smoke:oanda-practice
 
       - name: Production Next.js build
         run: npm run build

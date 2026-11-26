@@ -6,7 +6,10 @@ import type {
   NormalizedCandle,
   PriceBasis,
 } from '@/shared/contracts/marketData';
-import { buildDeterministicCandleKey } from '@/shared/utils/candleValidator';
+import {
+  buildDeterministicCandleKey,
+  buildScopedCandleStorageKey,
+} from '@/shared/utils/candleValidator';
 import {
   createManagedPgExecutor,
   isValidPostgresConnectionString,
@@ -21,8 +24,19 @@ export interface CandleUpsertSummary {
   revisionsDetected: CandleRevisionEvent[];
 }
 
+export const LEGACY_UNSCOPED_CONFIG_IDENTITY = 'legacy_unscoped';
+
+export interface CandleStorageScope {
+  configIdentityHash: string;
+  providerEnv?: string | null;
+  accountScopeHash?: string | null;
+}
+
 export interface CandleQueryOptions {
+  configIdentityHash?: string;
   provider?: string;
+  providerEnv?: string | null;
+  accountScopeHash?: string | null;
   providerSymbol?: string;
   priceBasis?: PriceBasis;
   granularity: MarketGranularity;
@@ -33,6 +47,8 @@ export interface FeedCheckpointRecord {
   checkpointKey: string;
   configIdentityHash: string | null;
   provider: string | null;
+  providerEnv?: string | null;
+  accountScopeHash?: string | null;
   priceBasis: PriceBasis | null;
   policyVersion: string | null;
   adapterName: string;
@@ -51,6 +67,10 @@ export interface FeedCheckpointRecord {
 
 export const DEFAULT_FEED_CHECKPOINT_KEY = 'XAUUSD:primary';
 
+export function buildScopedCheckpointKey(configIdentityHash: string): string {
+  return `XAUUSD:${configIdentityHash}`;
+}
+
 /**
  * Provider-neutral completed-candle repository contract.
  * Never persists production history to Next.js ephemeral container filesystem or browser localStorage.
@@ -61,13 +81,15 @@ export interface CandleStore {
   getLastPersistenceError(): string | null;
   upsertCandles(
     candles: readonly NormalizedCandle[],
-    detectedAtUtc?: string
+    detectedAtUtc?: string,
+    scope?: CandleStorageScope
   ): Promise<CandleUpsertSummary>;
   getCompletedCandles(options: CandleQueryOptions): Promise<NormalizedCandle[]>;
   getLatestCompletedCandle(
-    granularity: MarketGranularity
+    granularity: MarketGranularity,
+    scope?: Omit<CandleQueryOptions, 'granularity' | 'limit'>
   ): Promise<NormalizedCandle | null>;
-  getRevisionEvents(): Promise<CandleRevisionEvent[]>;
+  getRevisionEvents(configIdentityHash?: string): Promise<CandleRevisionEvent[]>;
   saveFeedCheckpoint(checkpoint: FeedCheckpointRecord): Promise<void>;
   getFeedCheckpoint(
     checkpointKey?: string
@@ -96,13 +118,25 @@ function diffCandleFields(
   return changed;
 }
 
+interface StoredInMemoryCandle {
+  configIdentityHash: string;
+  providerEnv: string | null;
+  accountScopeHash: string | null;
+  candle: NormalizedCandle;
+}
+
+interface StoredInMemoryRevision {
+  configIdentityHash: string;
+  event: CandleRevisionEvent;
+}
+
 /**
  * Deterministic in-memory candle store for unit tests and unconfigured zero-credential runs.
  * Reports HistoryPersistenceState = 'NOT_PERSISTENT' so UI never claims durable retention.
  */
 export class InMemoryCandleStore implements CandleStore {
-  private readonly records = new Map<string, NormalizedCandle>();
-  private readonly revisions: CandleRevisionEvent[] = [];
+  private readonly records = new Map<string, StoredInMemoryCandle>();
+  private readonly revisions: StoredInMemoryRevision[] = [];
   private readonly checkpoints = new Map<string, FeedCheckpointRecord>();
 
   getPersistenceState(): HistoryPersistenceState {
@@ -119,48 +153,70 @@ export class InMemoryCandleStore implements CandleStore {
 
   async upsertCandles(
     candles: readonly NormalizedCandle[],
-    detectedAtUtc: string = new Date().toISOString()
+    detectedAtUtc: string = new Date().toISOString(),
+    scope?: CandleStorageScope
   ): Promise<CandleUpsertSummary> {
     let inserted = 0;
     let unchanged = 0;
     const revisionsDetected: CandleRevisionEvent[] = [];
+
+    const configIdentityHash =
+      scope?.configIdentityHash?.trim() || LEGACY_UNSCOPED_CONFIG_IDENTITY;
+    const providerEnv = scope?.providerEnv ?? null;
+    const accountScopeHash = scope?.accountScopeHash ?? null;
 
     for (const candle of candles) {
       if (!candle.complete) {
         continue;
       }
 
-      const key = buildDeterministicCandleKey({
-        provider: candle.provider,
-        providerSymbol: candle.providerSymbol,
-        priceBasis: candle.priceBasis,
-        granularity: candle.granularity,
-        openTimeUtc: candle.openTimeUtc,
-      });
+      const storageKey = scope?.configIdentityHash
+        ? buildScopedCandleStorageKey(configIdentityHash, candle)
+        : buildDeterministicCandleKey({
+            provider: candle.provider,
+            providerSymbol: candle.providerSymbol,
+            priceBasis: candle.priceBasis,
+            granularity: candle.granularity,
+            openTimeUtc: candle.openTimeUtc,
+          });
+      const scopedCandle: NormalizedCandle = {
+        ...candle,
+        sourceCandleId: storageKey,
+      };
 
-      const existing = this.records.get(key);
+      const existing = this.records.get(storageKey);
       if (!existing) {
-        this.records.set(key, candle);
+        this.records.set(storageKey, {
+          configIdentityHash,
+          providerEnv,
+          accountScopeHash,
+          candle: scopedCandle,
+        });
         inserted += 1;
         continue;
       }
 
-      const changedFields = diffCandleFields(existing, candle);
+      const changedFields = diffCandleFields(existing.candle, scopedCandle);
       if (changedFields.length === 0) {
         unchanged += 1;
         continue;
       }
 
       const revision: CandleRevisionEvent = {
-        sourceCandleId: key,
+        sourceCandleId: storageKey,
         detectedAtUtc,
         changedFields,
-        previousClose: existing.close,
-        revisedClose: candle.close,
+        previousClose: existing.candle.close,
+        revisedClose: scopedCandle.close,
       };
-      this.revisions.push(revision);
+      this.revisions.push({ configIdentityHash, event: revision });
       revisionsDetected.push(revision);
-      this.records.set(key, candle);
+      this.records.set(storageKey, {
+        configIdentityHash,
+        providerEnv,
+        accountScopeHash,
+        candle: scopedCandle,
+      });
     }
 
     return { inserted, unchanged, revisionsDetected };
@@ -170,10 +226,31 @@ export class InMemoryCandleStore implements CandleStore {
     options: CandleQueryOptions
   ): Promise<NormalizedCandle[]> {
     const filtered = Array.from(this.records.values())
-      .filter((c) => {
+      .filter((entry) => {
+        const c = entry.candle;
         if (!c.complete) return false;
         if (c.granularity !== options.granularity) return false;
+        if (
+          options.configIdentityHash &&
+          entry.configIdentityHash !== options.configIdentityHash
+        ) {
+          return false;
+        }
         if (options.provider && c.provider !== options.provider) {
+          return false;
+        }
+        if (
+          options.providerEnv !== undefined &&
+          options.providerEnv !== null &&
+          entry.providerEnv !== options.providerEnv
+        ) {
+          return false;
+        }
+        if (
+          options.accountScopeHash !== undefined &&
+          options.accountScopeHash !== null &&
+          entry.accountScopeHash !== options.accountScopeHash
+        ) {
           return false;
         }
         if (
@@ -187,6 +264,7 @@ export class InMemoryCandleStore implements CandleStore {
         }
         return true;
       })
+      .map((entry) => entry.candle)
       .sort((a, b) => Date.parse(a.openTimeUtc) - Date.parse(b.openTimeUtc));
 
     const boundedLimit = Math.max(1, Math.min(options.limit, 500));
@@ -194,19 +272,33 @@ export class InMemoryCandleStore implements CandleStore {
   }
 
   async getLatestCompletedCandle(
-    granularity: MarketGranularity
+    granularity: MarketGranularity,
+    scope?: Omit<CandleQueryOptions, 'granularity' | 'limit'>
   ): Promise<NormalizedCandle | null> {
-    const rows = await this.getCompletedCandles({ granularity, limit: 1 });
+    const rows = await this.getCompletedCandles({
+      ...scope,
+      granularity,
+      limit: 1,
+    });
     return rows[0] ?? null;
   }
 
-  async getRevisionEvents(): Promise<CandleRevisionEvent[]> {
-    return [...this.revisions];
+  async getRevisionEvents(
+    configIdentityHash?: string
+  ): Promise<CandleRevisionEvent[]> {
+    if (!configIdentityHash) {
+      return this.revisions.map((r) => r.event);
+    }
+    return this.revisions
+      .filter((r) => r.configIdentityHash === configIdentityHash)
+      .map((r) => r.event);
   }
 
   async saveFeedCheckpoint(checkpoint: FeedCheckpointRecord): Promise<void> {
     this.checkpoints.set(checkpoint.checkpointKey, {
       ...checkpoint,
+      providerEnv: checkpoint.providerEnv ?? null,
+      accountScopeHash: checkpoint.accountScopeHash ?? null,
       warnings: [...checkpoint.warnings],
     });
   }
@@ -256,7 +348,10 @@ export class PostgresCandleStore implements CandleStore {
   static readonly SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS normalized_candles (
       source_candle_id TEXT PRIMARY KEY,
+      config_identity_hash TEXT NOT NULL DEFAULT 'legacy_unscoped',
       provider TEXT NOT NULL,
+      provider_env TEXT NULL,
+      account_scope_hash TEXT NULL,
       provider_symbol TEXT NOT NULL,
       granularity TEXT NOT NULL,
       price_basis TEXT NOT NULL,
@@ -392,7 +487,8 @@ export class PostgresCandleStore implements CandleStore {
 
   async upsertCandles(
     candles: readonly NormalizedCandle[],
-    detectedAtUtc: string = new Date().toISOString()
+    detectedAtUtc: string = new Date().toISOString(),
+    scope?: CandleStorageScope
   ): Promise<CandleUpsertSummary> {
     if (!this.executor) {
       return { inserted: 0, unchanged: 0, revisionsDetected: [] };
@@ -408,8 +504,17 @@ export class PostgresCandleStore implements CandleStore {
     let unchanged = 0;
     const revisionsDetected: CandleRevisionEvent[] = [];
 
+    const configIdentityHash =
+      scope?.configIdentityHash?.trim() || LEGACY_UNSCOPED_CONFIG_IDENTITY;
+    const providerEnv = scope?.providerEnv ?? null;
+    const accountScopeHash = scope?.accountScopeHash ?? null;
+
     for (const c of candles) {
       if (!c.complete) continue;
+
+      const scopedCandleId = scope?.configIdentityHash
+        ? buildScopedCandleStorageKey(configIdentityHash, c)
+        : c.sourceCandleId;
 
       const existingRes = await this.executor.query<{
         open_price: string;
@@ -422,7 +527,7 @@ export class PostgresCandleStore implements CandleStore {
         `SELECT open_price, high_price, low_price, close_price, volume, close_time_utc
          FROM normalized_candles
          WHERE source_candle_id = $1`,
-        [c.sourceCandleId]
+        [scopedCandleId]
       );
 
       const existing = existingRes.rows[0];
@@ -441,7 +546,7 @@ export class PostgresCandleStore implements CandleStore {
         }
 
         const rev: CandleRevisionEvent = {
-          sourceCandleId: c.sourceCandleId,
+          sourceCandleId: scopedCandleId,
           detectedAtUtc,
           changedFields,
           previousClose: String(existing.close_price),
@@ -452,14 +557,15 @@ export class PostgresCandleStore implements CandleStore {
 
         await this.executor.query(
           `INSERT INTO candle_revision_events (
-            source_candle_id, detected_at_utc, changed_fields, previous_close, revised_close
-          ) VALUES ($1, $2, $3, $4, $5)`,
+            source_candle_id, detected_at_utc, changed_fields, previous_close, revised_close, config_identity_hash
+          ) VALUES ($1, $2, $3, $4, $5, $6)`,
           [
             rev.sourceCandleId,
             rev.detectedAtUtc,
             rev.changedFields,
             rev.previousClose,
             rev.revisedClose,
+            configIdentityHash,
           ]
         );
       } else {
@@ -470,17 +576,21 @@ export class PostgresCandleStore implements CandleStore {
         `INSERT INTO normalized_candles (
           source_candle_id, provider, provider_symbol, granularity, price_basis,
           open_time_utc, close_time_utc, open_price, high_price, low_price, close_price,
-          volume, complete, source_retrieved_at_utc
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          volume, complete, source_retrieved_at_utc,
+          config_identity_hash, provider_env, account_scope_hash
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
         ON CONFLICT (source_candle_id) DO UPDATE SET
           open_price = EXCLUDED.open_price,
           high_price = EXCLUDED.high_price,
           low_price = EXCLUDED.low_price,
           close_price = EXCLUDED.close_price,
           volume = EXCLUDED.volume,
-          source_retrieved_at_utc = EXCLUDED.source_retrieved_at_utc`,
+          source_retrieved_at_utc = EXCLUDED.source_retrieved_at_utc,
+          config_identity_hash = EXCLUDED.config_identity_hash,
+          provider_env = EXCLUDED.provider_env,
+          account_scope_hash = EXCLUDED.account_scope_hash`,
         [
-          c.sourceCandleId,
+          scopedCandleId,
           c.provider,
           c.providerSymbol,
           c.granularity,
@@ -494,6 +604,9 @@ export class PostgresCandleStore implements CandleStore {
           c.volume,
           c.complete,
           c.sourceRetrievedAtUtc,
+          configIdentityHash,
+          providerEnv,
+          accountScopeHash,
         ]
       );
     }
@@ -518,9 +631,27 @@ export class PostgresCandleStore implements CandleStore {
       FROM normalized_candles
       WHERE complete = TRUE AND granularity = $1`;
 
+    if (options.configIdentityHash) {
+      params.push(options.configIdentityHash);
+      sql += ` AND config_identity_hash = $${params.length}`;
+    }
+
     if (options.provider) {
       params.push(options.provider);
       sql += ` AND provider = $${params.length}`;
+    }
+
+    if (options.providerEnv !== undefined && options.providerEnv !== null) {
+      params.push(options.providerEnv);
+      sql += ` AND provider_env = $${params.length}`;
+    }
+
+    if (
+      options.accountScopeHash !== undefined &&
+      options.accountScopeHash !== null
+    ) {
+      params.push(options.accountScopeHash);
+      sql += ` AND account_scope_hash = $${params.length}`;
     }
 
     if (options.providerSymbol) {
@@ -573,13 +704,20 @@ export class PostgresCandleStore implements CandleStore {
   }
 
   async getLatestCompletedCandle(
-    granularity: MarketGranularity
+    granularity: MarketGranularity,
+    scope?: Omit<CandleQueryOptions, 'granularity' | 'limit'>
   ): Promise<NormalizedCandle | null> {
-    const rows = await this.getCompletedCandles({ granularity, limit: 1 });
+    const rows = await this.getCompletedCandles({
+      ...scope,
+      granularity,
+      limit: 1,
+    });
     return rows[0] ?? null;
   }
 
-  async getRevisionEvents(): Promise<CandleRevisionEvent[]> {
+  async getRevisionEvents(
+    configIdentityHash?: string
+  ): Promise<CandleRevisionEvent[]> {
     if (!this.executor) return [...this.revisions];
     if (!this.verifiedConnected) {
       const state = await this.ensureReady();
@@ -587,18 +725,22 @@ export class PostgresCandleStore implements CandleStore {
     }
 
     try {
+      const params: unknown[] = [];
+      let sql = `SELECT source_candle_id, detected_at_utc, changed_fields, previous_close, revised_close
+         FROM candle_revision_events`;
+      if (configIdentityHash) {
+        params.push(configIdentityHash);
+        sql += ` WHERE config_identity_hash = $1`;
+      }
+      sql += ` ORDER BY detected_at_utc ASC`;
+
       const res = await this.executor.query<{
         source_candle_id: string;
         detected_at_utc: string | Date;
         changed_fields: string[];
         previous_close: string;
         revised_close: string;
-      }>(
-        `SELECT source_candle_id, detected_at_utc, changed_fields, previous_close, revised_close
-         FROM candle_revision_events
-         ORDER BY detected_at_utc ASC`,
-        []
-      );
+      }>(sql, params);
 
       return res.rows.map((row) => ({
         sourceCandleId: row.source_candle_id,
@@ -626,8 +768,9 @@ export class PostgresCandleStore implements CandleStore {
         checkpoint_key, config_identity_hash, provider, price_basis, policy_version,
         adapter_name, provider_symbol, state, provider_verified,
         last_successful_request_utc, last_provider_candle_open_utc, last_complete_candle_close_utc,
-        missing_bar_count, duplicate_bar_count, reason_code, warnings, updated_at_utc
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        missing_bar_count, duplicate_bar_count, reason_code, warnings, updated_at_utc,
+        provider_env, account_scope_hash
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
       ON CONFLICT (checkpoint_key) DO UPDATE SET
         config_identity_hash = EXCLUDED.config_identity_hash,
         provider = EXCLUDED.provider,
@@ -644,7 +787,9 @@ export class PostgresCandleStore implements CandleStore {
         duplicate_bar_count = EXCLUDED.duplicate_bar_count,
         reason_code = EXCLUDED.reason_code,
         warnings = EXCLUDED.warnings,
-        updated_at_utc = EXCLUDED.updated_at_utc`,
+        updated_at_utc = EXCLUDED.updated_at_utc,
+        provider_env = EXCLUDED.provider_env,
+        account_scope_hash = EXCLUDED.account_scope_hash`,
       [
         checkpoint.checkpointKey,
         checkpoint.configIdentityHash,
@@ -663,6 +808,8 @@ export class PostgresCandleStore implements CandleStore {
         checkpoint.reasonCode,
         checkpoint.warnings,
         checkpoint.updatedAtUtc,
+        checkpoint.providerEnv ?? null,
+        checkpoint.accountScopeHash ?? null,
       ]
     );
   }
@@ -680,6 +827,8 @@ export class PostgresCandleStore implements CandleStore {
       checkpoint_key: string;
       config_identity_hash: string | null;
       provider: string | null;
+      provider_env: string | null;
+      account_scope_hash: string | null;
       price_basis: PriceBasis | null;
       policy_version: string | null;
       adapter_name: string;
@@ -695,8 +844,8 @@ export class PostgresCandleStore implements CandleStore {
       warnings: string[] | null;
       updated_at_utc: string | Date;
     }>(
-      `SELECT checkpoint_key, config_identity_hash, provider, price_basis, policy_version,
-              adapter_name, provider_symbol, state, provider_verified,
+      `SELECT checkpoint_key, config_identity_hash, provider, provider_env, account_scope_hash,
+              price_basis, policy_version, adapter_name, provider_symbol, state, provider_verified,
               last_successful_request_utc, last_provider_candle_open_utc, last_complete_candle_close_utc,
               missing_bar_count, duplicate_bar_count, reason_code, warnings, updated_at_utc
        FROM market_feed_checkpoints
@@ -711,6 +860,8 @@ export class PostgresCandleStore implements CandleStore {
       checkpointKey: row.checkpoint_key,
       configIdentityHash: row.config_identity_hash ?? null,
       provider: row.provider ?? null,
+      providerEnv: row.provider_env ?? null,
+      accountScopeHash: row.account_scope_hash ?? null,
       priceBasis: row.price_basis ?? null,
       policyVersion: row.policy_version ?? null,
       adapterName: row.adapter_name,

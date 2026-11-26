@@ -22,7 +22,8 @@ import {
 } from '@/server/marketData/oandaV20Adapter';
 import type { HistoryPersistenceState } from '@/shared/contracts/marketData';
 import {
-  createAuthoritativeXauUsdClosurePolicy,
+  REGISTERED_VERIFIED_PROVIDER_SCHEDULES,
+  resolveVerifiedScheduleForScope,
   type AuthoritativeMarketClosurePolicy,
 } from '@/shared/utils/marketClosurePolicy';
 
@@ -81,6 +82,7 @@ export function computeMarketDataEnvFingerprint(
     backfillEnabled: env.BACKFILL_ENABLED ?? '',
     provider: env.MARKET_DATA_PROVIDER ?? 'none',
     oandaEnv: env.OANDA_ENV ?? '',
+    oandaDivision: env.OANDA_DIVISION ?? '',
     oandaAccountId: env.OANDA_ACCOUNT_ID ?? '',
     oandaApiToken: env.OANDA_API_TOKEN ?? '',
     oandaInstrument: env.OANDA_INSTRUMENT ?? '',
@@ -112,7 +114,16 @@ export function createMarketDataRuntime(
 
   if (gates.MARKET_FEED_ENABLED && providerChoice === 'oanda_v20') {
     const oandaConfig = parseOandaConfigFromEnv(env);
-    closurePolicy = createAuthoritativeXauUsdClosurePolicy();
+    const oandaDivision = env.OANDA_DIVISION?.trim().toUpperCase() || null;
+    // Only attach a closure schedule when explicitly verified for this exact
+    // (provider, division, instrument). Otherwise remains null -> UNKNOWN (fails closed).
+    closurePolicy = oandaConfig
+      ? resolveVerifiedScheduleForScope(REGISTERED_VERIFIED_PROVIDER_SCHEDULES, {
+          provider: 'oanda_v20',
+          division: oandaDivision,
+          instrument: oandaConfig.instrument,
+        })
+      : null;
     adapter = new OandaV20MarketDataAdapter(
       oandaConfig
         ? {
@@ -127,6 +138,7 @@ export function createMarketDataRuntime(
     configIdentity = buildFeedConfigIdentity({
       provider: 'oanda_v20',
       providerEnv: oandaConfig?.env ?? null,
+      providerDivision: oandaDivision,
       accountId: oandaConfig?.accountId ?? null,
       providerSymbol: oandaConfig?.instrument ?? null,
       priceBasis: adapter.alignmentPolicy.priceBasis,
@@ -137,6 +149,7 @@ export function createMarketDataRuntime(
     configIdentity = buildFeedConfigIdentity({
       provider: 'none',
       providerEnv: null,
+      providerDivision: null,
       accountId: null,
       providerSymbol: null,
       priceBasis: adapter.alignmentPolicy.priceBasis,

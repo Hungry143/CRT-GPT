@@ -26,6 +26,7 @@ export interface SyntheticSeriesOptions {
   providerSymbol?: string;
   priceBasis?: PriceBasis;
   retrievedAtUtc?: string;
+  basePrice?: number;
 }
 
 /**
@@ -39,6 +40,7 @@ export function buildSyntheticClosedCandles(
   const priceBasis = options.priceBasis ?? 'MID';
   const retrievedAtUtc =
     options.retrievedAtUtc ?? '2026-06-15T12:00:00.000Z';
+  const basePrice = options.basePrice ?? 2600;
 
   const candles: NormalizedCandle[] = [];
   let cursor = new Date(options.startOpenTimeUtc);
@@ -50,7 +52,7 @@ export function buildSyntheticClosedCandles(
       options.granularity,
       DEFAULT_ALIGNMENT_POLICY
     );
-    const base = 2600 + i * 2;
+    const base = basePrice + i * 2;
     const open = (base + 0.5).toFixed(3);
     const high = (base + 4.25).toFixed(3);
     const low = (base - 2.75).toFixed(3);
