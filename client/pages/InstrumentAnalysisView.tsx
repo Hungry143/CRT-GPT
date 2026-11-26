@@ -40,8 +40,7 @@ export function InstrumentAnalysisView({
               {selectedInstrument} Configuration Profile
             </h2>
             <p className="text-xs text-[#8B9BB0] mt-0.5">
-              Configuration-only registry record — no quotes, spreads, or
-              derived pricing in Stage 1
+              Configuration-only registry record — no verified backend OHLC, quotes, spreads, or derived pricing
             </p>
           </div>
           <span className="font-mono text-xs text-amber-300">
