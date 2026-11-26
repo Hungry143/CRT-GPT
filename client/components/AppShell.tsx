@@ -13,6 +13,7 @@ import { InstrumentAnalysisView } from '@/client/pages/InstrumentAnalysisView';
 import { SignalsView } from '@/client/pages/SignalsView';
 import { ResearchJournalView } from '@/client/pages/ResearchJournalView';
 import { SystemHealthView } from '@/client/pages/SystemHealthView';
+import { getUniverseInstrument, type InstrumentKey } from '@/shared/tradingSystem/universe';
 
 interface AppShellProps {
   initialDiagnostics: DiagnosticsSnapshot;
@@ -31,6 +32,8 @@ export function AppShell({
   const [diagnostics, setDiagnostics] =
     useState<DiagnosticsSnapshot>(initialDiagnostics);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [selectedInstrument, setSelectedInstrument] = useState<InstrumentKey>('XAUUSD');
+  const chartSymbol = getUniverseInstrument(selectedInstrument).chartSymbol;
 
   const refreshDiagnostics = useCallback(async () => {
     setIsRefreshing(true);
@@ -90,6 +93,7 @@ export function AppShell({
           initialServerTimeUtc={initialServerTimeUtc}
           isRefreshing={isRefreshing}
           onRefresh={refreshDiagnostics}
+          selectedInstrument={selectedInstrument}
           onOpenMobileNav={() => setMobileNavOpen(true)}
         />
 
@@ -104,12 +108,15 @@ export function AppShell({
             >
               {activeSection === 'command-center' && (
                 <CommandCenterView
+                  selectedInstrument={selectedInstrument}
+                  onSelectInstrument={setSelectedInstrument}
+                  chartSymbol={chartSymbol}
                   diagnostics={diagnostics}
                   isLoading={isRefreshing}
                 />
               )}
               {activeSection === 'instrument-analysis' && (
-                <InstrumentAnalysisView diagnostics={diagnostics} />
+                <InstrumentAnalysisView diagnostics={diagnostics} selectedInstrument={selectedInstrument} onSelectInstrument={setSelectedInstrument} chartSymbol={chartSymbol} />
               )}
               {activeSection === 'signals' && (
                 <SignalsView diagnostics={diagnostics} />
@@ -128,7 +135,7 @@ export function AppShell({
 
         <footer className="border-t border-[#1F2937] px-4 sm:px-6 py-3 text-[11px] text-[#64748B] flex flex-wrap items-center justify-between gap-2">
           <span>
-            CRT Intelligence · XAUUSD Discretionary Research Foundation (v0.1.0)
+            CRT Intelligence · 14-Market Signal-Only Platform (foundation)
           </span>
           <span>Signal-only architecture · Order execution disabled</span>
         </footer>
