@@ -20,6 +20,12 @@ export interface FetchCompletedCandlesRequest {
 export interface FetchCompletedCandlesResult {
   status: MarketDataProviderState;
   candles: NormalizedCandle[];
+  /**
+   * Populated ONLY when a fetch fails closed due to an unknown-closure gap (UNEXPECTED_BAR_GAP)
+   * with zero structural OHLC/duplicate corruption, allowing durable backfill workers to preserve
+   * individually validated historical candles without permanently losing history or stalling cursors.
+   */
+  validatedHistoricalCandles?: NormalizedCandle[];
   retrievedAtUtc: string;
   duplicateBarCount: number;
   missingBarCount: number;

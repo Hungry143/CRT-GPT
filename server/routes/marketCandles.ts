@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { resolveEffectiveFeedStatus } from '@/server/marketData/feedCheckpoint';
 import {
   resolveMarketDataRuntime,
   type MarketDataRuntime,
@@ -121,31 +122,43 @@ export async function buildMarketCandlesPayload(
   runtime: MarketDataRuntime = resolveMarketDataRuntime(),
   options: BuildMarketCandlesOptions = {}
 ): Promise<MarketCandlesResponse> {
-  runtime.historyPersistence = await runtime.store.ensureReady();
-  const statusSnapshot = await runtime.adapter.getStatus(now);
-  const adapterState = statusSnapshot.quality.state;
+  const schedule = options.verifiedSchedule ?? runtime.closurePolicy ?? null;
+  const effective = await resolveEffectiveFeedStatus(now, runtime, {
+    verifiedSchedule: schedule,
+    staleThresholdSeconds: options.staleThresholdSeconds,
+  });
+  const effectiveState = effective.quality.state;
 
-  // Fail closed whenever provider/adapter is not in a healthy serveable state
-  if (adapterState !== 'CONNECTED' && adapterState !== 'MARKET_CLOSED') {
+  // Fail closed whenever effective feed status (adapter + identity-validated durable checkpoint)
+  // is not in a healthy serveable state
+  if (effectiveState !== 'CONNECTED' && effectiveState !== 'MARKET_CLOSED') {
     return MarketCandlesResponseSchema.parse({
       schemaVersion: '1.0.0',
       serverTimeUtc: toUtcIsoString(now),
       instrument: params.instrument,
       granularity: params.granularity,
-      status: adapterState,
+      status: effectiveState,
       completedOnly: true,
       data: [],
       count: 0,
       limit: params.limit,
       reasonCode:
-        statusSnapshot.quality.reasonCode ??
-        (adapterState === 'NOT_CONFIGURED'
+        effective.quality.reasonCode ??
+        (effectiveState === 'NOT_CONFIGURED'
           ? 'NO_PROVIDER_CONFIGURED'
           : 'FEED_NOT_HEALTHY'),
     });
   }
 
+  // Scope reads strictly to active provider, symbol, and price basis so candles from a prior
+  // configuration never leak across provider/account/price-basis switches
   const storedCandles = await runtime.store.getCompletedCandles({
+    provider:
+      effective.activeProvider && effective.activeProvider !== 'none'
+        ? effective.activeProvider
+        : undefined,
+    providerSymbol: effective.activeProviderSymbol ?? undefined,
+    priceBasis: effective.activePriceBasis,
     granularity: params.granularity,
     limit: params.limit,
   });
@@ -156,7 +169,7 @@ export async function buildMarketCandlesPayload(
     requireComplete: true,
     enforceGracePeriod: true,
     enforceIntervalAlignment: true,
-    verifiedSchedule: options.verifiedSchedule ?? null,
+    verifiedSchedule: schedule,
   });
 
   const integrity = evaluateSeriesIntegrity(validated, {
@@ -165,7 +178,7 @@ export async function buildMarketCandlesPayload(
     policy: runtime.adapter.alignmentPolicy,
     staleThresholdSeconds:
       options.staleThresholdSeconds ?? runtime.staleThresholdSeconds,
-    verifiedSchedule: options.verifiedSchedule ?? null,
+    verifiedSchedule: schedule,
     failOnIncompleteBars: true,
   });
 
@@ -191,11 +204,11 @@ export async function buildMarketCandlesPayload(
     instrument: params.instrument,
     granularity: params.granularity,
     status:
-      adapterState === 'MARKET_CLOSED' ? 'MARKET_CLOSED' : integrity.state,
+      effectiveState === 'MARKET_CLOSED' ? 'MARKET_CLOSED' : integrity.state,
     completedOnly: true,
     data: validated.accepted,
     count: validated.accepted.length,
     limit: params.limit,
-    reasonCode: statusSnapshot.quality.reasonCode ?? integrity.reasonCode,
+    reasonCode: effective.quality.reasonCode ?? integrity.reasonCode,
   });
 }

@@ -13,11 +13,16 @@ import {
   type CandleStore,
   type FeedCheckpointRecord,
 } from '@/server/marketData/candleStore';
+import {
+  buildFeedConfigIdentity,
+  type FeedConfigIdentity,
+} from '@/server/marketData/feedCheckpoint';
 import { OANDA_MAX_CANDLES_PER_REQUEST } from '@/server/marketData/oandaV20Adapter';
 import {
   DEFAULT_STALENESS_THRESHOLDS_SECONDS,
   evaluateFeedStatusFreshness,
 } from '@/shared/utils/feedIntegrity';
+import type { VerifiedMarketSchedule } from '@/shared/utils/sessionClock';
 
 export const WORKER_DEFAULT_GRANULARITIES: readonly MarketGranularity[] = [
   'D1',
@@ -45,6 +50,11 @@ export interface IngestionWorkerConfig {
   maxConsecutiveFailures?: number;
   lookbackHoursByGranularity?: Partial<Record<MarketGranularity, number>>;
   checkpointKey?: string;
+  /**
+   * Keeps the Node.js event loop alive while `running === true` so the standalone worker
+   * process stays alive and periodically ingests data until `stop()` is invoked. Defaults to `true`.
+   */
+  keepProcessAlive?: boolean;
   /**
    * Internal testing hook only: allows sub-5s intervals in deterministic unit tests.
    */
@@ -102,8 +112,11 @@ const DEFAULT_LOOKBACK_HOURS: Record<MarketGranularity, number> = {
  * - Live ingestion is DISABLED by default (`marketFeedEnabled=false`, `backfillEnabled=false`).
  * - Never executes inside Next.js serverless API request handlers; run via `scripts/ingestion-worker.ts`
  *   or an external cron/process supervisor.
- * - Enforces overlap locking, per-cycle wall-clock bounds, batch/page caps, circuit breaker,
- *   and fail-closed checkpoint persistence into CandleStore.
+ * - Uses chained `setTimeout` scheduling (kept ref'd while running) + an in-flight lock so the
+ *   worker stays alive periodically ingesting data with zero overlapping cycles.
+ * - `stop()` clears pending timers, aborts in-flight requests, awaits active cycle drain, and
+ *   resolves `waitUntilStopped()` cleanly before database pools are closed.
+ * - Stamps canonical `FeedConfigIdentity` onto every durable checkpoint persisted into `CandleStore`.
  */
 export class MarketDataIngestionWorker {
   readonly deploymentRequirement =
@@ -112,6 +125,8 @@ export class MarketDataIngestionWorker {
   private readonly adapter: MarketDataAdapter;
   private readonly store: CandleStore;
   private readonly backfillService: BackfillService;
+  private readonly configIdentity: FeedConfigIdentity;
+  private readonly verifiedSchedule: VerifiedMarketSchedule | null;
   private readonly nowFn: () => Date;
 
   private readonly marketFeedEnabled: boolean;
@@ -124,11 +139,16 @@ export class MarketDataIngestionWorker {
   private readonly maxConsecutiveFailures: number;
   private readonly lookbackHours: Record<MarketGranularity, number>;
   private readonly checkpointKey: string;
+  private readonly keepProcessAlive: boolean;
 
   private running = false;
   private inFlight = false;
-  private timer: ReturnType<typeof setInterval> | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
   private abortController: AbortController | null = null;
+  private activeCyclePromise: Promise<IngestionCycleReport> | null = null;
+  private stoppedPromise: Promise<void> | null = null;
+  private resolveStopped: (() => void) | null = null;
+
   private cyclesAttempted = 0;
   private cyclesCompleted = 0;
   private cyclesSkippedOverlap = 0;
@@ -138,13 +158,27 @@ export class MarketDataIngestionWorker {
   constructor(options: {
     adapter: MarketDataAdapter;
     store: CandleStore;
+    configIdentity?: FeedConfigIdentity;
+    verifiedSchedule?: VerifiedMarketSchedule | null;
     config?: IngestionWorkerConfig;
     nowFn?: () => Date;
   }) {
     const cfg = options.config ?? {};
     this.adapter = options.adapter;
     this.store = options.store;
+    this.verifiedSchedule = options.verifiedSchedule ?? null;
     this.nowFn = options.nowFn ?? (() => new Date());
+
+    this.configIdentity =
+      options.configIdentity ??
+      buildFeedConfigIdentity({
+        provider:
+          options.adapter.adapterName === 'OandaV20MarketDataAdapter'
+            ? 'oanda_v20'
+            : options.adapter.adapterName,
+        priceBasis: options.adapter.alignmentPolicy.priceBasis,
+        policyVersion: options.adapter.alignmentPolicy.policyVersion,
+      });
 
     this.marketFeedEnabled = cfg.marketFeedEnabled === true;
     this.backfillEnabled = cfg.backfillEnabled === true;
@@ -178,6 +212,7 @@ export class MarketDataIngestionWorker {
       ...(cfg.lookbackHoursByGranularity ?? {}),
     };
     this.checkpointKey = cfg.checkpointKey ?? DEFAULT_FEED_CHECKPOINT_KEY;
+    this.keepProcessAlive = cfg.keepProcessAlive ?? true;
 
     this.backfillService = new BackfillService({
       adapter: this.adapter,
@@ -274,12 +309,35 @@ export class MarketDataIngestionWorker {
     this.inFlight = true;
     this.cyclesAttempted += 1;
 
+    const cyclePromise = this.executeCycleInternal(startedAt, externalSignal);
+    this.activeCyclePromise = cyclePromise;
+
+    try {
+      return await cyclePromise;
+    } finally {
+      if (this.activeCyclePromise === cyclePromise) {
+        this.activeCyclePromise = null;
+      }
+      this.inFlight = false;
+    }
+  }
+
+  private async executeCycleInternal(
+    startedAt: Date,
+    externalSignal?: AbortSignal
+  ): Promise<IngestionCycleReport> {
+    const startedAtUtc = startedAt.toISOString();
     const cycleController = new AbortController();
     const onAbort = () => cycleController.abort();
-    externalSignal?.addEventListener('abort', onAbort, { once: true });
-    this.abortController?.signal.addEventListener('abort', onAbort, {
-      once: true,
-    });
+
+    if (externalSignal?.aborted || this.abortController?.signal.aborted) {
+      cycleController.abort();
+    } else {
+      externalSignal?.addEventListener('abort', onAbort, { once: true });
+      this.abortController?.signal.addEventListener('abort', onAbort, {
+        once: true,
+      });
+    }
 
     const summaries: GranularityCycleSummary[] = [];
     let totalInserted = 0;
@@ -309,8 +367,18 @@ export class MarketDataIngestionWorker {
           break;
         }
 
-        const latestStored =
-          await this.store.getLatestCompletedCandle(granularity);
+        const latestStoredRows = await this.store.getCompletedCandles({
+          provider:
+            this.configIdentity.provider !== 'none'
+              ? this.configIdentity.provider
+              : undefined,
+          providerSymbol: this.configIdentity.providerSymbol ?? undefined,
+          priceBasis: this.configIdentity.priceBasis,
+          granularity,
+          limit: 1,
+        });
+        const latestStored = latestStoredRows[0] ?? null;
+
         const now = this.nowFn();
         const defaultLookbackMs =
           this.lookbackHours[granularity] * 3_600_000;
@@ -393,7 +461,6 @@ export class MarketDataIngestionWorker {
     } finally {
       externalSignal?.removeEventListener('abort', onAbort);
       this.abortController?.signal.removeEventListener('abort', onAbort);
-      this.inFlight = false;
     }
   }
 
@@ -419,20 +486,26 @@ export class MarketDataIngestionWorker {
           : adapterStatus.quality.duplicateBarCount,
       nowUtc: now,
       staleThresholdSeconds: DEFAULT_STALENESS_THRESHOLDS_SECONDS.M15,
+      verifiedSchedule: this.verifiedSchedule,
       reasonCode: summary.reasonCode ?? adapterStatus.quality.reasonCode,
       warnings: adapterStatus.quality.warnings,
     });
 
     let finalState: MarketDataProviderState = evaluated.state;
     if (summary.cycleFailed && finalState === 'CONNECTED') {
-      finalState =
-        summary.totalDuplicateBars > 0 ? 'ERROR' : 'STALE';
+      finalState = summary.totalDuplicateBars > 0 ? 'ERROR' : 'STALE';
     }
 
     const checkpoint: FeedCheckpointRecord = {
       checkpointKey: this.checkpointKey,
+      configIdentityHash: this.configIdentity.configIdentityHash,
+      provider: this.configIdentity.provider,
+      priceBasis: this.configIdentity.priceBasis,
+      policyVersion: this.configIdentity.policyVersion,
       adapterName: adapterStatus.adapterName,
-      providerSymbol: adapterStatus.instrument?.providerSymbol ?? null,
+      providerSymbol:
+        adapterStatus.instrument?.providerSymbol ??
+        this.configIdentity.providerSymbol,
       state: finalState,
       providerVerified: adapterStatus.providerVerified,
       lastSuccessfulRequestUtc: adapterStatus.quality.lastSuccessfulRequestUtc,
@@ -460,11 +533,42 @@ export class MarketDataIngestionWorker {
     }
   }
 
+  private scheduleNextTick(delayMs: number): void {
+    if (!this.running) return;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      if (!this.running) return;
+
+      void this.runCycleOnce()
+        .catch(() => {
+          // Errors are captured inside cycle report; keep scheduling resilient
+        })
+        .finally(() => {
+          if (this.running) {
+            this.scheduleNextTick(this.pollIntervalMs);
+          }
+        });
+    }, delayMs);
+
+    if (!this.keepProcessAlive && typeof this.timer.unref === 'function') {
+      this.timer.unref();
+    }
+  }
+
   /**
-   * Starts the bounded periodic worker loop.
+   * Starts the bounded, non-overlapping periodic worker loop using chained timeouts.
+   * Keeps the standalone Node process alive while running (`keepProcessAlive: true`).
    * Refuses to start when live ingestion is disabled (default).
    */
-  start(): { started: boolean; reasonCode: string | null } {
+  start(options: { runImmediately?: boolean } = {}): {
+    started: boolean;
+    reasonCode: string | null;
+  } {
     if (!this.isLiveIngestionAllowed()) {
       return { started: false, reasonCode: 'LIVE_INGESTION_DISABLED' };
     }
@@ -474,28 +578,49 @@ export class MarketDataIngestionWorker {
 
     this.running = true;
     this.abortController = new AbortController();
-    this.timer = setInterval(() => {
-      void this.runCycleOnce();
-    }, this.pollIntervalMs);
-    if (typeof this.timer.unref === 'function') {
-      this.timer.unref();
-    }
+    this.stoppedPromise = new Promise<void>((resolve) => {
+      this.resolveStopped = resolve;
+    });
+
+    const initialDelayMs = options.runImmediately ? 0 : this.pollIntervalMs;
+    this.scheduleNextTick(initialDelayMs);
 
     return { started: true, reasonCode: null };
   }
 
   /**
-   * Gracefully stops the worker loop and aborts any in-flight ingestion cycle.
+   * Resolves once `stop()` has drained any active cycle and stopped the worker loop.
+   */
+  waitUntilStopped(): Promise<void> {
+    return this.stoppedPromise ?? Promise.resolve();
+  }
+
+  /**
+   * Gracefully stops the worker loop, aborts any in-flight cycle, and awaits active cycle drain
+   * before resolving so database pools are never closed mid-query.
    */
   async stop(): Promise<void> {
     this.running = false;
     if (this.timer) {
-      clearInterval(this.timer);
+      clearTimeout(this.timer);
       this.timer = null;
     }
     if (this.abortController) {
       this.abortController.abort();
       this.abortController = null;
+    }
+    if (this.activeCyclePromise) {
+      try {
+        await this.activeCyclePromise;
+      } catch {
+        // Ignore cycle errors during graceful shutdown
+      }
+    }
+    if (this.resolveStopped) {
+      const done = this.resolveStopped;
+      this.resolveStopped = null;
+      this.stoppedPromise = null;
+      done();
     }
   }
 }

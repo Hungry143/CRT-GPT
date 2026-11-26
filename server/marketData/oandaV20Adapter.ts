@@ -636,9 +636,16 @@ export class OandaV20MarketDataAdapter implements MarketDataAdapter {
       if (!integrity.healthy) {
         this.state = integrity.state;
         this.reasonCode = integrity.reasonCode;
+        const canPreserveValidHistory =
+          integrity.reasonCode === 'UNEXPECTED_BAR_GAP' &&
+          validation.duplicateBarCount === 0 &&
+          validation.accepted.length > 0;
         return {
           status: this.state,
           candles: [],
+          ...(canPreserveValidHistory
+            ? { validatedHistoricalCandles: validation.accepted }
+            : {}),
           retrievedAtUtc: nowUtc.toISOString(),
           duplicateBarCount: validation.duplicateBarCount,
           missingBarCount: validation.missingBarCount,

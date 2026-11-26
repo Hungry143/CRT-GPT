@@ -13,13 +13,23 @@ import {
   type CandleStore,
 } from '@/server/marketData/candleStore';
 import {
+  buildFeedConfigIdentity,
+  type FeedConfigIdentity,
+} from '@/server/marketData/feedCheckpoint';
+import {
   OandaV20MarketDataAdapter,
   parseOandaConfigFromEnv,
 } from '@/server/marketData/oandaV20Adapter';
 import type { HistoryPersistenceState } from '@/shared/contracts/marketData';
+import {
+  createAuthoritativeXauUsdClosurePolicy,
+  type AuthoritativeMarketClosurePolicy,
+} from '@/shared/utils/marketClosurePolicy';
 
 export interface MarketDataRuntime {
   readonly fingerprint: string;
+  readonly configIdentity: FeedConfigIdentity;
+  readonly closurePolicy: AuthoritativeMarketClosurePolicy | null;
   adapter: MarketDataAdapter;
   store: CandleStore;
   historyPersistence: HistoryPersistenceState;
@@ -75,6 +85,8 @@ export function computeMarketDataEnvFingerprint(
     oandaApiToken: env.OANDA_API_TOKEN ?? '',
     oandaInstrument: env.OANDA_INSTRUMENT ?? '',
     databaseUrl: env.DATABASE_URL ?? '',
+    databaseCaCert: env.DATABASE_CA_CERT ?? '',
+    nodeEnv: env.NODE_ENV ?? '',
     staleThresholdSeconds: env.MARKET_STALE_THRESHOLD_SECONDS ?? '',
   });
   return createHash('sha256').update(canonical).digest('hex').slice(0, 16);
@@ -95,29 +107,52 @@ export function createMarketDataRuntime(
   );
 
   let adapter: MarketDataAdapter;
+  let closurePolicy: AuthoritativeMarketClosurePolicy | null = null;
+  let configIdentity: FeedConfigIdentity;
+
   if (gates.MARKET_FEED_ENABLED && providerChoice === 'oanda_v20') {
     const oandaConfig = parseOandaConfigFromEnv(env);
+    closurePolicy = createAuthoritativeXauUsdClosurePolicy();
     adapter = new OandaV20MarketDataAdapter(
       oandaConfig
         ? {
             ...oandaConfig,
+            verifiedSchedule: closurePolicy,
             ...(staleThresholdSeconds !== undefined
               ? { staleThresholdSeconds }
               : {}),
           }
         : null
     );
+    configIdentity = buildFeedConfigIdentity({
+      provider: 'oanda_v20',
+      providerEnv: oandaConfig?.env ?? null,
+      accountId: oandaConfig?.accountId ?? null,
+      providerSymbol: oandaConfig?.instrument ?? null,
+      priceBasis: adapter.alignmentPolicy.priceBasis,
+      policyVersion: adapter.alignmentPolicy.policyVersion,
+    });
   } else {
     adapter = new NoProviderAdapter();
+    configIdentity = buildFeedConfigIdentity({
+      provider: 'none',
+      providerEnv: null,
+      accountId: null,
+      providerSymbol: null,
+      priceBasis: adapter.alignmentPolicy.priceBasis,
+      policyVersion: adapter.alignmentPolicy.policyVersion,
+    });
   }
 
   const databaseUrl = env.DATABASE_URL?.trim();
   const store: CandleStore = databaseUrl
-    ? new PostgresCandleStore({ databaseUrl })
+    ? new PostgresCandleStore({ databaseUrl, env })
     : new InMemoryCandleStore();
 
   return {
     fingerprint: computeMarketDataEnvFingerprint(env),
+    configIdentity,
+    closurePolicy,
     adapter,
     store,
     historyPersistence: store.getPersistenceState(),

@@ -159,7 +159,28 @@ export class BackfillService implements BackfillScheduler {
       missingBarCount += page.missingBarCount;
       warnings.push(...page.warnings);
 
-      if (page.status !== 'CONNECTED') {
+      if (page.status !== 'CONNECTED' && page.status !== 'MARKET_CLOSED') {
+        const recoverableHistorical =
+          page.status === 'STALE' &&
+          page.reasonCode === 'UNEXPECTED_BAR_GAP' &&
+          page.duplicateBarCount === 0 &&
+          Array.isArray(page.validatedHistoricalCandles) &&
+          page.validatedHistoricalCandles.length > 0
+            ? page.validatedHistoricalCandles.filter(
+                (c) => Date.parse(c.openTimeUtc) < toMs
+              )
+            : [];
+
+        if (recoverableHistorical.length > 0) {
+          const upsert = await this.store.upsertCandles(
+            recoverableHistorical,
+            this.nowFn().toISOString()
+          );
+          insertedCount += upsert.inserted;
+          unchangedCount += upsert.unchanged;
+          revisionsDetected.push(...upsert.revisionsDetected);
+        }
+
         return {
           status: 'FAILED',
           pagesFetched,

@@ -3,9 +3,7 @@ import {
   readFeatureGates,
 } from '@/server/config/featureGates';
 import { MarketDataIngestionWorker } from '@/server/marketData/ingestionWorker';
-import {
-  createMarketDataRuntime,
-} from '@/server/marketData/registry';
+import { createMarketDataRuntime } from '@/server/marketData/registry';
 
 async function main(): Promise<void> {
   const gates = readFeatureGates(process.env);
@@ -27,13 +25,16 @@ async function main(): Promise<void> {
   const worker = new MarketDataIngestionWorker({
     adapter: runtime.adapter,
     store: runtime.store,
+    configIdentity: runtime.configIdentity,
+    verifiedSchedule: runtime.closurePolicy,
     config: {
       marketFeedEnabled: gates.MARKET_FEED_ENABLED,
       backfillEnabled,
+      keepProcessAlive: true,
     },
   });
 
-  const startRes = worker.start();
+  const startRes = worker.start({ runImmediately: true });
   if (!startRes.started) {
     console.log(
       JSON.stringify({
@@ -45,16 +46,25 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const shutdown = async () => {
+  let shuttingDown = false;
+  const shutdown = async (signalName: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(
+      JSON.stringify({
+        event: 'ingestion_worker_stopping',
+        signal: signalName,
+      })
+    );
     await worker.stop();
     await runtime.store.close();
     process.exit(0);
   };
 
-  process.on('SIGINT', () => void shutdown());
-  process.on('SIGTERM', () => void shutdown());
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
-  await worker.runCycleOnce();
+  await worker.waitUntilStopped();
 }
 
 void main();

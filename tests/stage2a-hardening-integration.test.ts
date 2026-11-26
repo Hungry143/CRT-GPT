@@ -15,6 +15,7 @@ import {
   type FeedCheckpointRecord,
   type PgQueryExecutor,
 } from '../server/marketData/candleStore';
+import { buildFeedConfigIdentity } from '../server/marketData/feedCheckpoint';
 import {
   OandaV20MarketDataAdapter,
   type OandaV20Config,
@@ -54,7 +55,11 @@ function createStatefulFakePgExecutor() {
       executedQueries.push({ sql, params });
       const normalized = sql.replace(/\s+/g, ' ').trim();
 
-      if (normalized.startsWith('CREATE TABLE') || normalized.startsWith('CREATE INDEX')) {
+      if (
+        normalized.startsWith('CREATE TABLE') ||
+        normalized.startsWith('CREATE INDEX') ||
+        normalized.startsWith('ALTER TABLE')
+      ) {
         return { rows: [] };
       }
 
@@ -115,13 +120,21 @@ function createStatefulFakePgExecutor() {
       if (normalized.includes('FROM normalized_candles WHERE complete = TRUE')) {
         const granularity = String(params[0]);
         const limit = Number(params[1]);
-        const providerSymbol = params[2] ? String(params[2]) : null;
+        const providerMatch = /AND provider = \$(\d+)/.exec(normalized);
+        const symbolMatch = /AND provider_symbol = \$(\d+)/.exec(normalized);
+        const basisMatch = /AND price_basis = \$(\d+)/.exec(normalized);
+        const provider = providerMatch ? String(params[Number(providerMatch[1]) - 1]) : null;
+        const providerSymbol = symbolMatch ? String(params[Number(symbolMatch[1]) - 1]) : null;
+        const priceBasis = basisMatch ? String(params[Number(basisMatch[1]) - 1]) : null;
+
         const rows = Array.from(candles.values())
           .filter(
             (r) =>
               r.complete === true &&
               r.granularity === granularity &&
-              (!providerSymbol || r.provider_symbol === providerSymbol)
+              (!provider || r.provider === provider) &&
+              (!providerSymbol || r.provider_symbol === providerSymbol) &&
+              (!priceBasis || r.price_basis === priceBasis)
           )
           .sort(
             (a, b) =>
@@ -150,18 +163,22 @@ function createStatefulFakePgExecutor() {
       if (normalized.startsWith('INSERT INTO market_feed_checkpoints')) {
         checkpoints.set(String(params[0]), {
           checkpoint_key: params[0],
-          adapter_name: params[1],
-          provider_symbol: params[2],
-          state: params[3],
-          provider_verified: params[4],
-          last_successful_request_utc: params[5],
-          last_provider_candle_open_utc: params[6],
-          last_complete_candle_close_utc: params[7],
-          missing_bar_count: params[8],
-          duplicate_bar_count: params[9],
-          reason_code: params[10],
-          warnings: params[11],
-          updated_at_utc: params[12],
+          config_identity_hash: params[1],
+          provider: params[2],
+          price_basis: params[3],
+          policy_version: params[4],
+          adapter_name: params[5],
+          provider_symbol: params[6],
+          state: params[7],
+          provider_verified: params[8],
+          last_successful_request_utc: params[9],
+          last_provider_candle_open_utc: params[10],
+          last_complete_candle_close_utc: params[11],
+          missing_bar_count: params[12],
+          duplicate_bar_count: params[13],
+          reason_code: params[14],
+          warnings: params[15],
+          updated_at_utc: params[16],
         });
         return { rows: [] };
       }
@@ -219,12 +236,18 @@ test('PostgreSQL migrations, persistent status, checkpoints, and revisions survi
 
   // 1. Idempotent versioned migrations
   const mig1 = await runPostgresMigrations(fakeDb.executor);
-  assert.deepEqual(mig1.appliedVersions, ['001_stage2a_market_data']);
+  assert.deepEqual(mig1.appliedVersions, [
+    '001_stage2a_market_data',
+    '002_checkpoint_identity',
+  ]);
   assert.deepEqual(mig1.skippedVersions, []);
 
   const mig2 = await runPostgresMigrations(fakeDb.executor);
   assert.deepEqual(mig2.appliedVersions, []);
-  assert.deepEqual(mig2.skippedVersions, ['001_stage2a_market_data']);
+  assert.deepEqual(mig2.skippedVersions, [
+    '001_stage2a_market_data',
+    '002_checkpoint_identity',
+  ]);
 
   // 2. Store #1 writes candles, revision, and feed checkpoint
   const store1 = new PostgresCandleStore({
@@ -253,8 +276,28 @@ test('PostgreSQL migrations, persistent status, checkpoints, and revisions survi
   );
   assert.equal(upsert2.revisionsDetected.length, 1);
 
+  const freshOandaConfig: OandaV20Config = {
+    env: 'practice',
+    accountId: '101-001-1234567-001',
+    apiToken: 'token-abc-123456',
+    instrument: 'XAU_USD',
+  };
+  const freshAdapter = new OandaV20MarketDataAdapter(freshOandaConfig);
+  const configIdentity = buildFeedConfigIdentity({
+    provider: 'oanda_v20',
+    providerEnv: freshOandaConfig.env,
+    accountId: freshOandaConfig.accountId,
+    providerSymbol: freshOandaConfig.instrument,
+    priceBasis: freshAdapter.alignmentPolicy.priceBasis,
+    policyVersion: freshAdapter.alignmentPolicy.policyVersion,
+  });
+
   const checkpoint: FeedCheckpointRecord = {
     checkpointKey: DEFAULT_FEED_CHECKPOINT_KEY,
+    configIdentityHash: configIdentity.configIdentityHash,
+    provider: configIdentity.provider,
+    priceBasis: configIdentity.priceBasis,
+    policyVersion: configIdentity.policyVersion,
     adapterName: 'OandaV20MarketDataAdapter',
     providerSymbol: 'XAU_USD',
     state: 'CONNECTED',
@@ -279,15 +322,10 @@ test('PostgreSQL migrations, persistent status, checkpoints, and revisions survi
   assert.equal(revisionsFromDb.length, 1);
   assert.equal(revisionsFromDb[0].revisedClose, '2603.999');
 
-  const freshOandaConfig: OandaV20Config = {
-    env: 'practice',
-    accountId: '101-001-1234567-001',
-    apiToken: 'token-abc-123456',
-    instrument: 'XAU_USD',
-  };
-  const freshAdapter = new OandaV20MarketDataAdapter(freshOandaConfig);
   const runtime: MarketDataRuntime = {
     fingerprint: 'test-persistent',
+    configIdentity,
+    closurePolicy: null,
     adapter: freshAdapter,
     store: store2,
     historyPersistence: store2.getPersistenceState(),
@@ -435,6 +473,15 @@ test('stale, gapped, and corrupted candle series FAIL CLOSED on adapter and /api
 
   const runtime: MarketDataRuntime = {
     fingerprint: 'test-fail-closed',
+    configIdentity: buildFeedConfigIdentity({
+      provider: 'oanda_v20',
+      providerEnv: 'practice',
+      accountId: '101-001-1234567-001',
+      providerSymbol: 'XAU_USD',
+      priceBasis: healthyAdapter.alignmentPolicy.priceBasis,
+      policyVersion: healthyAdapter.alignmentPolicy.policyVersion,
+    }),
+    closurePolicy: null,
     adapter: healthyAdapter,
     store,
     historyPersistence: 'NOT_PERSISTENT',
@@ -481,6 +528,8 @@ test('stale, gapped, and corrupted candle series FAIL CLOSED on adapter and /api
     startOpenTimeUtc: '2026-06-19T20:00:00.000Z',
     count: 1,
     granularity: 'H1',
+    provider: 'oanda_v20',
+    providerSymbol: 'XAU_USD',
     retrievedAtUtc: '2026-06-20T12:00:00.000Z',
   });
   const weekendStore = new InMemoryCandleStore();

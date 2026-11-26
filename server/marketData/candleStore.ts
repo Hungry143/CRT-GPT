@@ -4,6 +4,7 @@ import type {
   MarketDataProviderState,
   MarketGranularity,
   NormalizedCandle,
+  PriceBasis,
 } from '@/shared/contracts/marketData';
 import { buildDeterministicCandleKey } from '@/shared/utils/candleValidator';
 import {
@@ -21,13 +22,19 @@ export interface CandleUpsertSummary {
 }
 
 export interface CandleQueryOptions {
+  provider?: string;
   providerSymbol?: string;
+  priceBasis?: PriceBasis;
   granularity: MarketGranularity;
   limit: number;
 }
 
 export interface FeedCheckpointRecord {
   checkpointKey: string;
+  configIdentityHash: string | null;
+  provider: string | null;
+  priceBasis: PriceBasis | null;
+  policyVersion: string | null;
   adapterName: string;
   providerSymbol: string | null;
   state: MarketDataProviderState;
@@ -166,10 +173,16 @@ export class InMemoryCandleStore implements CandleStore {
       .filter((c) => {
         if (!c.complete) return false;
         if (c.granularity !== options.granularity) return false;
+        if (options.provider && c.provider !== options.provider) {
+          return false;
+        }
         if (
           options.providerSymbol &&
           c.providerSymbol !== options.providerSymbol
         ) {
+          return false;
+        }
+        if (options.priceBasis && c.priceBasis !== options.priceBasis) {
           return false;
         }
         return true;
@@ -263,6 +276,7 @@ export class PostgresCandleStore implements CandleStore {
     databaseUrl?: string | null;
     executor?: PgQueryExecutor | null;
     autoMigrate?: boolean;
+    env?: Record<string, string | undefined>;
   }) {
     const trimmedUrl = options.databaseUrl?.trim() ?? '';
     this.databaseUrl = trimmedUrl.length > 0 ? trimmedUrl : null;
@@ -277,10 +291,25 @@ export class PostgresCandleStore implements CandleStore {
       this.databaseUrl &&
       isValidPostgresConnectionString(this.databaseUrl)
     ) {
-      const managed = createManagedPgExecutor(this.databaseUrl);
-      this.managedExecutor = managed;
-      this.executor = managed;
-      this.verifiedConnected = false;
+      try {
+        const managed = createManagedPgExecutor(
+          this.databaseUrl,
+          options.env ?? process.env
+        );
+        this.managedExecutor = managed;
+        this.executor = managed;
+        this.verifiedConnected = false;
+      } catch (err) {
+        this.managedExecutor = null;
+        this.executor = null;
+        this.verifiedConnected = false;
+        this.lastError = redactSensitiveText(
+          err instanceof Error
+            ? err.message
+            : 'Invalid PostgreSQL configuration',
+          [this.databaseUrl]
+        );
+      }
     } else {
       this.managedExecutor = null;
       this.executor = null;
@@ -489,9 +518,19 @@ export class PostgresCandleStore implements CandleStore {
       FROM normalized_candles
       WHERE complete = TRUE AND granularity = $1`;
 
+    if (options.provider) {
+      params.push(options.provider);
+      sql += ` AND provider = $${params.length}`;
+    }
+
     if (options.providerSymbol) {
-      sql += ` AND provider_symbol = $3`;
       params.push(options.providerSymbol);
+      sql += ` AND provider_symbol = $${params.length}`;
+    }
+
+    if (options.priceBasis) {
+      params.push(options.priceBasis);
+      sql += ` AND price_basis = $${params.length}`;
     }
 
     sql += ` ORDER BY open_time_utc DESC LIMIT $2`;
@@ -584,11 +623,16 @@ export class PostgresCandleStore implements CandleStore {
 
     await this.executor.query(
       `INSERT INTO market_feed_checkpoints (
-        checkpoint_key, adapter_name, provider_symbol, state, provider_verified,
+        checkpoint_key, config_identity_hash, provider, price_basis, policy_version,
+        adapter_name, provider_symbol, state, provider_verified,
         last_successful_request_utc, last_provider_candle_open_utc, last_complete_candle_close_utc,
         missing_bar_count, duplicate_bar_count, reason_code, warnings, updated_at_utc
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
       ON CONFLICT (checkpoint_key) DO UPDATE SET
+        config_identity_hash = EXCLUDED.config_identity_hash,
+        provider = EXCLUDED.provider,
+        price_basis = EXCLUDED.price_basis,
+        policy_version = EXCLUDED.policy_version,
         adapter_name = EXCLUDED.adapter_name,
         provider_symbol = EXCLUDED.provider_symbol,
         state = EXCLUDED.state,
@@ -603,6 +647,10 @@ export class PostgresCandleStore implements CandleStore {
         updated_at_utc = EXCLUDED.updated_at_utc`,
       [
         checkpoint.checkpointKey,
+        checkpoint.configIdentityHash,
+        checkpoint.provider,
+        checkpoint.priceBasis,
+        checkpoint.policyVersion,
         checkpoint.adapterName,
         checkpoint.providerSymbol,
         checkpoint.state,
@@ -630,6 +678,10 @@ export class PostgresCandleStore implements CandleStore {
 
     const res = await this.executor.query<{
       checkpoint_key: string;
+      config_identity_hash: string | null;
+      provider: string | null;
+      price_basis: PriceBasis | null;
+      policy_version: string | null;
       adapter_name: string;
       provider_symbol: string | null;
       state: MarketDataProviderState;
@@ -643,7 +695,8 @@ export class PostgresCandleStore implements CandleStore {
       warnings: string[] | null;
       updated_at_utc: string | Date;
     }>(
-      `SELECT checkpoint_key, adapter_name, provider_symbol, state, provider_verified,
+      `SELECT checkpoint_key, config_identity_hash, provider, price_basis, policy_version,
+              adapter_name, provider_symbol, state, provider_verified,
               last_successful_request_utc, last_provider_candle_open_utc, last_complete_candle_close_utc,
               missing_bar_count, duplicate_bar_count, reason_code, warnings, updated_at_utc
        FROM market_feed_checkpoints
@@ -656,6 +709,10 @@ export class PostgresCandleStore implements CandleStore {
 
     return {
       checkpointKey: row.checkpoint_key,
+      configIdentityHash: row.config_identity_hash ?? null,
+      provider: row.provider ?? null,
+      priceBasis: row.price_basis ?? null,
+      policyVersion: row.policy_version ?? null,
       adapterName: row.adapter_name,
       providerSymbol: row.provider_symbol,
       state: row.state,

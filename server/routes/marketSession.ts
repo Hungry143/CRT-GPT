@@ -1,36 +1,46 @@
+import { resolveEffectiveFeedStatus } from '@/server/marketData/feedCheckpoint';
 import {
   resolveMarketDataRuntime,
   type MarketDataRuntime,
 } from '@/server/marketData/registry';
-import { buildMarketStatusPayload } from '@/server/routes/marketStatus';
 import {
   MarketSessionResponseSchema,
   type MarketSessionResponse,
   type ObservedMarketAvailability,
 } from '@/shared/contracts/marketData';
-import { buildSessionClockSnapshot } from '@/shared/utils/sessionClock';
+import {
+  buildSessionClockSnapshot,
+  type VerifiedMarketSchedule,
+} from '@/shared/utils/sessionClock';
 import { toUtcIsoString } from '@/shared/utils/time';
+
+export interface BuildMarketSessionOptions {
+  verifiedSchedule?: VerifiedMarketSchedule | null;
+}
 
 export async function buildMarketSessionPayload(
   now: Date = new Date(),
-  runtime: MarketDataRuntime = resolveMarketDataRuntime()
+  runtime: MarketDataRuntime = resolveMarketDataRuntime(),
+  options: BuildMarketSessionOptions = {}
 ): Promise<MarketSessionResponse> {
-  const status = await buildMarketStatusPayload(now, runtime);
+  const schedule = options.verifiedSchedule ?? runtime.closurePolicy ?? null;
+  const effective = await resolveEffectiveFeedStatus(now, runtime, {
+    verifiedSchedule: schedule,
+  });
 
   let observedMarketAvailability: ObservedMarketAvailability =
     'UNOBSERVED_NO_FEED';
-  if (status.quality.state === 'CONNECTED') {
+  if (effective.quality.state === 'CONNECTED') {
     observedMarketAvailability = 'OBSERVED_ACTIVE';
-  } else if (status.quality.state === 'STALE') {
+  } else if (effective.quality.state === 'STALE') {
     observedMarketAvailability = 'OBSERVED_STALE';
-  } else if (status.quality.state === 'MARKET_CLOSED') {
+  } else if (effective.quality.state === 'MARKET_CLOSED') {
     observedMarketAvailability = 'OBSERVED_CLOSED';
   }
 
   const session = buildSessionClockSnapshot(now, {
     policy: runtime.adapter.alignmentPolicy,
-    // No unverified holiday calendar assumed; remains UNKNOWN unless a verified schedule is injected.
-    verifiedSchedule: null,
+    verifiedSchedule: schedule,
     observedMarketAvailability,
   });
 

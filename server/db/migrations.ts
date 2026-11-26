@@ -95,6 +95,20 @@ export const STAGE_2A_MIGRATIONS: readonly PostgresMigrationDefinition[] = [
       )`,
     ],
   },
+  {
+    version: '002_checkpoint_identity',
+    name: 'Add configuration identity columns to market_feed_checkpoints and scoped candle lookup index',
+    statements: [
+      `ALTER TABLE market_feed_checkpoints
+        ADD COLUMN IF NOT EXISTS config_identity_hash TEXT NULL,
+        ADD COLUMN IF NOT EXISTS provider TEXT NULL,
+        ADD COLUMN IF NOT EXISTS price_basis TEXT NULL,
+        ADD COLUMN IF NOT EXISTS policy_version TEXT NULL`,
+      `CREATE INDEX IF NOT EXISTS idx_normalized_candles_scoped
+        ON normalized_candles (provider, provider_symbol, price_basis, granularity, open_time_utc DESC)
+        WHERE complete = TRUE`,
+    ],
+  },
 ];
 
 /**

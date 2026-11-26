@@ -178,10 +178,7 @@ export function evaluateSeriesIntegrity(
     };
   }
 
-  if (
-    latest &&
-    isConfirmedClosedAt(options.nowUtc, options.verifiedSchedule)
-  ) {
+  if (isConfirmedClosedAt(options.nowUtc, options.verifiedSchedule)) {
     return {
       healthy: true,
       failClosed: false,
