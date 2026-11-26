@@ -10,6 +10,8 @@ import {
   type MarketGranularity,
 } from '@/shared/contracts/marketData';
 import { validateCandleSeries } from '@/shared/utils/candleValidator';
+import { evaluateSeriesIntegrity } from '@/shared/utils/feedIntegrity';
+import type { VerifiedMarketSchedule } from '@/shared/utils/sessionClock';
 import { toUtcIsoString } from '@/shared/utils/time';
 
 export const MARKET_CANDLES_MAX_LIMIT = 500;
@@ -104,6 +106,11 @@ export function parseMarketCandlesQuery(
   };
 }
 
+export interface BuildMarketCandlesOptions {
+  verifiedSchedule?: VerifiedMarketSchedule | null;
+  staleThresholdSeconds?: number;
+}
+
 export async function buildMarketCandlesPayload(
   params: {
     instrument: 'XAUUSD';
@@ -111,22 +118,30 @@ export async function buildMarketCandlesPayload(
     limit: number;
   },
   now: Date = new Date(),
-  runtime: MarketDataRuntime = resolveMarketDataRuntime()
+  runtime: MarketDataRuntime = resolveMarketDataRuntime(),
+  options: BuildMarketCandlesOptions = {}
 ): Promise<MarketCandlesResponse> {
+  runtime.historyPersistence = await runtime.store.ensureReady();
   const statusSnapshot = await runtime.adapter.getStatus(now);
+  const adapterState = statusSnapshot.quality.state;
 
-  if (statusSnapshot.quality.state === 'NOT_CONFIGURED') {
+  // Fail closed whenever provider/adapter is not in a healthy serveable state
+  if (adapterState !== 'CONNECTED' && adapterState !== 'MARKET_CLOSED') {
     return MarketCandlesResponseSchema.parse({
       schemaVersion: '1.0.0',
       serverTimeUtc: toUtcIsoString(now),
       instrument: params.instrument,
       granularity: params.granularity,
-      status: 'NOT_CONFIGURED',
+      status: adapterState,
       completedOnly: true,
       data: [],
       count: 0,
       limit: params.limit,
-      reasonCode: statusSnapshot.quality.reasonCode ?? 'NO_PROVIDER_CONFIGURED',
+      reasonCode:
+        statusSnapshot.quality.reasonCode ??
+        (adapterState === 'NOT_CONFIGURED'
+          ? 'NO_PROVIDER_CONFIGURED'
+          : 'FEED_NOT_HEALTHY'),
     });
   }
 
@@ -141,18 +156,46 @@ export async function buildMarketCandlesPayload(
     requireComplete: true,
     enforceGracePeriod: true,
     enforceIntervalAlignment: true,
+    verifiedSchedule: options.verifiedSchedule ?? null,
   });
+
+  const integrity = evaluateSeriesIntegrity(validated, {
+    granularity: params.granularity,
+    nowUtc: now,
+    policy: runtime.adapter.alignmentPolicy,
+    staleThresholdSeconds:
+      options.staleThresholdSeconds ?? runtime.staleThresholdSeconds,
+    verifiedSchedule: options.verifiedSchedule ?? null,
+    failOnIncompleteBars: true,
+  });
+
+  // Strict fail-closed policy: never serve stale, gapped, duplicate, or corrupted candle series
+  if (!integrity.healthy) {
+    return MarketCandlesResponseSchema.parse({
+      schemaVersion: '1.0.0',
+      serverTimeUtc: toUtcIsoString(now),
+      instrument: params.instrument,
+      granularity: params.granularity,
+      status: integrity.state,
+      completedOnly: true,
+      data: [],
+      count: 0,
+      limit: params.limit,
+      reasonCode: integrity.reasonCode,
+    });
+  }
 
   return MarketCandlesResponseSchema.parse({
     schemaVersion: '1.0.0',
     serverTimeUtc: toUtcIsoString(now),
     instrument: params.instrument,
     granularity: params.granularity,
-    status: statusSnapshot.quality.state,
+    status:
+      adapterState === 'MARKET_CLOSED' ? 'MARKET_CLOSED' : integrity.state,
     completedOnly: true,
     data: validated.accepted,
     count: validated.accepted.length,
     limit: params.limit,
-    reasonCode: statusSnapshot.quality.reasonCode,
+    reasonCode: statusSnapshot.quality.reasonCode ?? integrity.reasonCode,
   });
 }

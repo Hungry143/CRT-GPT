@@ -1,10 +1,18 @@
 import type {
   CandleRevisionEvent,
   HistoryPersistenceState,
+  MarketDataProviderState,
   MarketGranularity,
   NormalizedCandle,
 } from '@/shared/contracts/marketData';
 import { buildDeterministicCandleKey } from '@/shared/utils/candleValidator';
+import {
+  createManagedPgExecutor,
+  isValidPostgresConnectionString,
+  type ManagedPgExecutor,
+} from '@/server/db/postgres';
+import { runPostgresMigrations } from '@/server/db/migrations';
+import { redactSensitiveText } from '@/server/marketData/adapter';
 
 export interface CandleUpsertSummary {
   inserted: number;
@@ -18,12 +26,32 @@ export interface CandleQueryOptions {
   limit: number;
 }
 
+export interface FeedCheckpointRecord {
+  checkpointKey: string;
+  adapterName: string;
+  providerSymbol: string | null;
+  state: MarketDataProviderState;
+  providerVerified: boolean;
+  lastSuccessfulRequestUtc: string | null;
+  lastProviderCandleOpenUtc: string | null;
+  lastCompleteCandleCloseUtc: string | null;
+  missingBarCount: number | null;
+  duplicateBarCount: number | null;
+  reasonCode: string | null;
+  warnings: string[];
+  updatedAtUtc: string;
+}
+
+export const DEFAULT_FEED_CHECKPOINT_KEY = 'XAUUSD:primary';
+
 /**
  * Provider-neutral completed-candle repository contract.
  * Never persists production history to Next.js ephemeral container filesystem or browser localStorage.
  */
 export interface CandleStore {
   getPersistenceState(): HistoryPersistenceState;
+  ensureReady(): Promise<HistoryPersistenceState>;
+  getLastPersistenceError(): string | null;
   upsertCandles(
     candles: readonly NormalizedCandle[],
     detectedAtUtc?: string
@@ -33,6 +61,11 @@ export interface CandleStore {
     granularity: MarketGranularity
   ): Promise<NormalizedCandle | null>;
   getRevisionEvents(): Promise<CandleRevisionEvent[]>;
+  saveFeedCheckpoint(checkpoint: FeedCheckpointRecord): Promise<void>;
+  getFeedCheckpoint(
+    checkpointKey?: string
+  ): Promise<FeedCheckpointRecord | null>;
+  close(): Promise<void>;
 }
 
 function diffCandleFields(
@@ -63,9 +96,18 @@ function diffCandleFields(
 export class InMemoryCandleStore implements CandleStore {
   private readonly records = new Map<string, NormalizedCandle>();
   private readonly revisions: CandleRevisionEvent[] = [];
+  private readonly checkpoints = new Map<string, FeedCheckpointRecord>();
 
   getPersistenceState(): HistoryPersistenceState {
     return 'NOT_PERSISTENT';
+  }
+
+  async ensureReady(): Promise<HistoryPersistenceState> {
+    return 'NOT_PERSISTENT';
+  }
+
+  getLastPersistenceError(): string | null {
+    return null;
   }
 
   async upsertCandles(
@@ -148,6 +190,24 @@ export class InMemoryCandleStore implements CandleStore {
   async getRevisionEvents(): Promise<CandleRevisionEvent[]> {
     return [...this.revisions];
   }
+
+  async saveFeedCheckpoint(checkpoint: FeedCheckpointRecord): Promise<void> {
+    this.checkpoints.set(checkpoint.checkpointKey, {
+      ...checkpoint,
+      warnings: [...checkpoint.warnings],
+    });
+  }
+
+  async getFeedCheckpoint(
+    checkpointKey: string = DEFAULT_FEED_CHECKPOINT_KEY
+  ): Promise<FeedCheckpointRecord | null> {
+    const cp = this.checkpoints.get(checkpointKey);
+    return cp ? { ...cp, warnings: [...cp.warnings] } : null;
+  }
+
+  async close(): Promise<void> {
+    // No external connections to tear down
+  }
 }
 
 /**
@@ -161,13 +221,24 @@ export interface PgQueryExecutor {
 }
 
 /**
- * Optional persistent PostgreSQL candle store behind explicit DATABASE_URL configuration.
- * Uses strictly parameterized SQL queries ($1..$N) to eliminate SQL injection vectors.
+ * Persistent PostgreSQL candle store behind explicit DATABASE_URL configuration.
+ * - Uses strictly parameterized SQL queries ($1..$N) to eliminate SQL injection vectors.
+ * - Automatically creates a bounded `pg.Pool` when DATABASE_URL is configured and no custom executor is injected.
+ * - Runs idempotent versioned migrations via `ensureReady()` and fails closed to `POSTGRES_CONFIGURED`
+ *   if connectivity or migration fails (never crashing status endpoints or leaking credentials).
  */
 export class PostgresCandleStore implements CandleStore {
+  private readonly databaseUrl: string | null;
   private readonly executor: PgQueryExecutor | null;
+  private readonly managedExecutor: ManagedPgExecutor | null;
   private readonly connectionConfigured: boolean;
+  private readonly autoMigrate: boolean;
   private readonly revisions: CandleRevisionEvent[] = [];
+
+  private verifiedConnected: boolean;
+  private migrationsApplied = false;
+  private initPromise: Promise<HistoryPersistenceState> | null = null;
+  private lastError: string | null = null;
 
   static readonly SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS normalized_candles (
@@ -191,18 +262,103 @@ export class PostgresCandleStore implements CandleStore {
   constructor(options: {
     databaseUrl?: string | null;
     executor?: PgQueryExecutor | null;
+    autoMigrate?: boolean;
   }) {
-    this.connectionConfigured = Boolean(
-      options.databaseUrl && options.databaseUrl.trim().length > 0
-    );
-    this.executor = options.executor ?? null;
+    const trimmedUrl = options.databaseUrl?.trim() ?? '';
+    this.databaseUrl = trimmedUrl.length > 0 ? trimmedUrl : null;
+    this.connectionConfigured = this.databaseUrl !== null;
+    this.autoMigrate = options.autoMigrate ?? true;
+
+    if (options.executor) {
+      this.executor = options.executor;
+      this.managedExecutor = null;
+      this.verifiedConnected = this.connectionConfigured;
+    } else if (
+      this.databaseUrl &&
+      isValidPostgresConnectionString(this.databaseUrl)
+    ) {
+      const managed = createManagedPgExecutor(this.databaseUrl);
+      this.managedExecutor = managed;
+      this.executor = managed;
+      this.verifiedConnected = false;
+    } else {
+      this.managedExecutor = null;
+      this.executor = null;
+      this.verifiedConnected = false;
+      if (this.databaseUrl) {
+        this.lastError = 'Invalid DATABASE_URL format; expected postgres:// or postgresql://';
+      }
+    }
   }
 
   getPersistenceState(): HistoryPersistenceState {
     if (!this.connectionConfigured) {
       return 'NOT_PERSISTENT';
     }
-    return this.executor ? 'POSTGRES_CONNECTED' : 'POSTGRES_CONFIGURED';
+    return this.executor && this.verifiedConnected
+      ? 'POSTGRES_CONNECTED'
+      : 'POSTGRES_CONFIGURED';
+  }
+
+  getLastPersistenceError(): string | null {
+    return this.lastError;
+  }
+
+  /**
+   * Verifies PostgreSQL connectivity and applies idempotent Stage 2A migrations once per store lifecycle.
+   * If connectivity fails, transitions safely to POSTGRES_CONFIGURED without throwing or leaking secrets.
+   */
+  async ensureReady(): Promise<HistoryPersistenceState> {
+    if (!this.connectionConfigured) {
+      return 'NOT_PERSISTENT';
+    }
+    if (!this.executor) {
+      return 'POSTGRES_CONFIGURED';
+    }
+    if (this.verifiedConnected && (!this.autoMigrate || this.migrationsApplied)) {
+      return 'POSTGRES_CONNECTED';
+    }
+
+    if (!this.initPromise) {
+      this.initPromise = this.initializeConnection().finally(() => {
+        this.initPromise = null;
+      });
+    }
+
+    return this.initPromise;
+  }
+
+  private async initializeConnection(): Promise<HistoryPersistenceState> {
+    if (!this.executor) return 'POSTGRES_CONFIGURED';
+
+    try {
+      if (this.managedExecutor) {
+        const reachable = await this.managedExecutor.ping();
+        if (!reachable) {
+          this.verifiedConnected = false;
+          this.lastError = 'PostgreSQL connection health check failed';
+          return 'POSTGRES_CONFIGURED';
+        }
+      }
+
+      if (this.autoMigrate && !this.migrationsApplied) {
+        await runPostgresMigrations(this.executor);
+        this.migrationsApplied = true;
+      }
+
+      this.verifiedConnected = true;
+      this.lastError = null;
+      return 'POSTGRES_CONNECTED';
+    } catch (err) {
+      this.verifiedConnected = false;
+      const rawMsg =
+        err instanceof Error ? err.message : 'PostgreSQL initialization failed';
+      this.lastError = redactSensitiveText(
+        rawMsg,
+        this.databaseUrl ? [this.databaseUrl] : []
+      );
+      return 'POSTGRES_CONFIGURED';
+    }
   }
 
   async upsertCandles(
@@ -211,6 +367,12 @@ export class PostgresCandleStore implements CandleStore {
   ): Promise<CandleUpsertSummary> {
     if (!this.executor) {
       return { inserted: 0, unchanged: 0, revisionsDetected: [] };
+    }
+    if (!this.verifiedConnected) {
+      const state = await this.ensureReady();
+      if (state !== 'POSTGRES_CONNECTED') {
+        return { inserted: 0, unchanged: 0, revisionsDetected: [] };
+      }
     }
 
     let inserted = 0;
@@ -237,10 +399,11 @@ export class PostgresCandleStore implements CandleStore {
       const existing = existingRes.rows[0];
       if (existing) {
         const changedFields: string[] = [];
-        if (existing.open_price !== c.open) changedFields.push('open');
-        if (existing.high_price !== c.high) changedFields.push('high');
-        if (existing.low_price !== c.low) changedFields.push('low');
-        if (existing.close_price !== c.close) changedFields.push('close');
+        if (String(existing.open_price) !== c.open) changedFields.push('open');
+        if (String(existing.high_price) !== c.high) changedFields.push('high');
+        if (String(existing.low_price) !== c.low) changedFields.push('low');
+        if (String(existing.close_price) !== c.close)
+          changedFields.push('close');
         if (existing.volume !== c.volume) changedFields.push('volume');
 
         if (changedFields.length === 0) {
@@ -252,11 +415,24 @@ export class PostgresCandleStore implements CandleStore {
           sourceCandleId: c.sourceCandleId,
           detectedAtUtc,
           changedFields,
-          previousClose: existing.close_price,
+          previousClose: String(existing.close_price),
           revisedClose: c.close,
         };
         this.revisions.push(rev);
         revisionsDetected.push(rev);
+
+        await this.executor.query(
+          `INSERT INTO candle_revision_events (
+            source_candle_id, detected_at_utc, changed_fields, previous_close, revised_close
+          ) VALUES ($1, $2, $3, $4, $5)`,
+          [
+            rev.sourceCandleId,
+            rev.detectedAtUtc,
+            rev.changedFields,
+            rev.previousClose,
+            rev.revisedClose,
+          ]
+        );
       } else {
         inserted += 1;
       }
@@ -300,6 +476,10 @@ export class PostgresCandleStore implements CandleStore {
     options: CandleQueryOptions
   ): Promise<NormalizedCandle[]> {
     if (!this.executor) return [];
+    if (!this.verifiedConnected) {
+      const state = await this.ensureReady();
+      if (state !== 'POSTGRES_CONNECTED') return [];
+    }
 
     const boundedLimit = Math.max(1, Math.min(options.limit, 500));
     const params: unknown[] = [options.granularity, boundedLimit];
@@ -322,15 +502,15 @@ export class PostgresCandleStore implements CandleStore {
       provider_symbol: string;
       granularity: MarketGranularity;
       price_basis: 'MID' | 'BID' | 'ASK';
-      open_time_utc: string;
-      close_time_utc: string;
+      open_time_utc: string | Date;
+      close_time_utc: string | Date;
       open_price: string;
       high_price: string;
       low_price: string;
       close_price: string;
       volume: number | null;
       complete: boolean;
-      source_retrieved_at_utc: string;
+      source_retrieved_at_utc: string | Date;
     }>(sql, params);
 
     return res.rows
@@ -361,6 +541,146 @@ export class PostgresCandleStore implements CandleStore {
   }
 
   async getRevisionEvents(): Promise<CandleRevisionEvent[]> {
-    return [...this.revisions];
+    if (!this.executor) return [...this.revisions];
+    if (!this.verifiedConnected) {
+      const state = await this.ensureReady();
+      if (state !== 'POSTGRES_CONNECTED') return [...this.revisions];
+    }
+
+    try {
+      const res = await this.executor.query<{
+        source_candle_id: string;
+        detected_at_utc: string | Date;
+        changed_fields: string[];
+        previous_close: string;
+        revised_close: string;
+      }>(
+        `SELECT source_candle_id, detected_at_utc, changed_fields, previous_close, revised_close
+         FROM candle_revision_events
+         ORDER BY detected_at_utc ASC`,
+        []
+      );
+
+      return res.rows.map((row) => ({
+        sourceCandleId: row.source_candle_id,
+        detectedAtUtc: new Date(row.detected_at_utc).toISOString(),
+        changedFields: Array.isArray(row.changed_fields)
+          ? row.changed_fields
+          : [],
+        previousClose: String(row.previous_close),
+        revisedClose: String(row.revised_close),
+      }));
+    } catch {
+      return [...this.revisions];
+    }
+  }
+
+  async saveFeedCheckpoint(checkpoint: FeedCheckpointRecord): Promise<void> {
+    if (!this.executor) return;
+    if (!this.verifiedConnected) {
+      const state = await this.ensureReady();
+      if (state !== 'POSTGRES_CONNECTED') return;
+    }
+
+    await this.executor.query(
+      `INSERT INTO market_feed_checkpoints (
+        checkpoint_key, adapter_name, provider_symbol, state, provider_verified,
+        last_successful_request_utc, last_provider_candle_open_utc, last_complete_candle_close_utc,
+        missing_bar_count, duplicate_bar_count, reason_code, warnings, updated_at_utc
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+      ON CONFLICT (checkpoint_key) DO UPDATE SET
+        adapter_name = EXCLUDED.adapter_name,
+        provider_symbol = EXCLUDED.provider_symbol,
+        state = EXCLUDED.state,
+        provider_verified = EXCLUDED.provider_verified,
+        last_successful_request_utc = EXCLUDED.last_successful_request_utc,
+        last_provider_candle_open_utc = EXCLUDED.last_provider_candle_open_utc,
+        last_complete_candle_close_utc = EXCLUDED.last_complete_candle_close_utc,
+        missing_bar_count = EXCLUDED.missing_bar_count,
+        duplicate_bar_count = EXCLUDED.duplicate_bar_count,
+        reason_code = EXCLUDED.reason_code,
+        warnings = EXCLUDED.warnings,
+        updated_at_utc = EXCLUDED.updated_at_utc`,
+      [
+        checkpoint.checkpointKey,
+        checkpoint.adapterName,
+        checkpoint.providerSymbol,
+        checkpoint.state,
+        checkpoint.providerVerified,
+        checkpoint.lastSuccessfulRequestUtc,
+        checkpoint.lastProviderCandleOpenUtc,
+        checkpoint.lastCompleteCandleCloseUtc,
+        checkpoint.missingBarCount,
+        checkpoint.duplicateBarCount,
+        checkpoint.reasonCode,
+        checkpoint.warnings,
+        checkpoint.updatedAtUtc,
+      ]
+    );
+  }
+
+  async getFeedCheckpoint(
+    checkpointKey: string = DEFAULT_FEED_CHECKPOINT_KEY
+  ): Promise<FeedCheckpointRecord | null> {
+    if (!this.executor) return null;
+    if (!this.verifiedConnected) {
+      const state = await this.ensureReady();
+      if (state !== 'POSTGRES_CONNECTED') return null;
+    }
+
+    const res = await this.executor.query<{
+      checkpoint_key: string;
+      adapter_name: string;
+      provider_symbol: string | null;
+      state: MarketDataProviderState;
+      provider_verified: boolean;
+      last_successful_request_utc: string | Date | null;
+      last_provider_candle_open_utc: string | Date | null;
+      last_complete_candle_close_utc: string | Date | null;
+      missing_bar_count: number | null;
+      duplicate_bar_count: number | null;
+      reason_code: string | null;
+      warnings: string[] | null;
+      updated_at_utc: string | Date;
+    }>(
+      `SELECT checkpoint_key, adapter_name, provider_symbol, state, provider_verified,
+              last_successful_request_utc, last_provider_candle_open_utc, last_complete_candle_close_utc,
+              missing_bar_count, duplicate_bar_count, reason_code, warnings, updated_at_utc
+       FROM market_feed_checkpoints
+       WHERE checkpoint_key = $1`,
+      [checkpointKey]
+    );
+
+    const row = res.rows[0];
+    if (!row) return null;
+
+    return {
+      checkpointKey: row.checkpoint_key,
+      adapterName: row.adapter_name,
+      providerSymbol: row.provider_symbol,
+      state: row.state,
+      providerVerified: row.provider_verified,
+      lastSuccessfulRequestUtc: row.last_successful_request_utc
+        ? new Date(row.last_successful_request_utc).toISOString()
+        : null,
+      lastProviderCandleOpenUtc: row.last_provider_candle_open_utc
+        ? new Date(row.last_provider_candle_open_utc).toISOString()
+        : null,
+      lastCompleteCandleCloseUtc: row.last_complete_candle_close_utc
+        ? new Date(row.last_complete_candle_close_utc).toISOString()
+        : null,
+      missingBarCount: row.missing_bar_count,
+      duplicateBarCount: row.duplicate_bar_count,
+      reasonCode: row.reason_code,
+      warnings: Array.isArray(row.warnings) ? row.warnings : [],
+      updatedAtUtc: new Date(row.updated_at_utc).toISOString(),
+    };
+  }
+
+  async close(): Promise<void> {
+    if (this.managedExecutor) {
+      await this.managedExecutor.close();
+      this.verifiedConnected = false;
+    }
   }
 }

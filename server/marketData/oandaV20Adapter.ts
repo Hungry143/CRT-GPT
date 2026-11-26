@@ -17,6 +17,10 @@ import {
   type VerifiedMarketSchedule,
 } from '@/shared/utils/sessionClock';
 import {
+  evaluateFeedStatusFreshness,
+  evaluateSeriesIntegrity,
+} from '@/shared/utils/feedIntegrity';
+import {
   redactSensitiveText,
   type AdapterStatusSnapshot,
   type FetchCompletedCandlesRequest,
@@ -96,6 +100,7 @@ export interface OandaV20Config {
   requestTimeoutMs?: number;
   maxRetries?: number;
   baseRetryDelayMs?: number;
+  staleThresholdSeconds?: number;
   verifiedSchedule?: VerifiedMarketSchedule | null;
 }
 
@@ -608,12 +613,19 @@ export class OandaV20MarketDataAdapter implements MarketDataAdapter {
         verifiedSchedule: this.config.verifiedSchedule ?? null,
       });
 
+      const integrity = evaluateSeriesIntegrity(validation, {
+        granularity: request.granularity,
+        nowUtc,
+        policy: this.alignmentPolicy,
+        staleThresholdSeconds: this.config.staleThresholdSeconds,
+        verifiedSchedule: this.config.verifiedSchedule ?? null,
+        failOnIncompleteBars: false,
+      });
+
       this.lastSuccessfulRequestUtc = nowUtc.toISOString();
       this.duplicateBarCount = validation.duplicateBarCount;
       this.missingBarCount = validation.missingBarCount;
-      this.warnings = validation.warnings;
-      this.state = 'CONNECTED';
-      this.reasonCode = null;
+      this.warnings = integrity.warnings;
 
       const latest = validation.accepted.at(-1) ?? null;
       if (latest) {
@@ -621,14 +633,31 @@ export class OandaV20MarketDataAdapter implements MarketDataAdapter {
         this.lastCompleteCandleCloseUtc = latest.closeTimeUtc;
       }
 
+      if (!integrity.healthy) {
+        this.state = integrity.state;
+        this.reasonCode = integrity.reasonCode;
+        return {
+          status: this.state,
+          candles: [],
+          retrievedAtUtc: nowUtc.toISOString(),
+          duplicateBarCount: validation.duplicateBarCount,
+          missingBarCount: validation.missingBarCount,
+          warnings: integrity.warnings,
+          reasonCode: integrity.reasonCode,
+        };
+      }
+
+      this.state = integrity.state;
+      this.reasonCode = integrity.reasonCode;
+
       return {
         status: this.state,
         candles: validation.accepted,
         retrievedAtUtc: nowUtc.toISOString(),
         duplicateBarCount: validation.duplicateBarCount,
         missingBarCount: validation.missingBarCount,
-        warnings: validation.warnings,
-        reasonCode: null,
+        warnings: integrity.warnings,
+        reasonCode: integrity.reasonCode,
       };
     } catch (err) {
       const msg = redactSensitiveText(
@@ -651,31 +680,33 @@ export class OandaV20MarketDataAdapter implements MarketDataAdapter {
   }
 
   async getStatus(now: Date = this.nowFn()): Promise<AdapterStatusSnapshot> {
-    const freshnessSeconds =
-      this.lastCompleteCandleCloseUtc !== null
-        ? Math.max(
-            0,
-            Math.floor(
-              (now.getTime() - Date.parse(this.lastCompleteCandleCloseUtc)) / 1000
-            )
-          )
-        : null;
+    const evaluated = evaluateFeedStatusFreshness({
+      currentState: this.state,
+      lastCompleteCandleCloseUtc: this.lastCompleteCandleCloseUtc,
+      missingBarCount: this.missingBarCount,
+      duplicateBarCount: this.duplicateBarCount,
+      nowUtc: now,
+      staleThresholdSeconds: this.config?.staleThresholdSeconds,
+      verifiedSchedule: this.config?.verifiedSchedule ?? null,
+      reasonCode: this.reasonCode,
+      warnings: this.warnings,
+    });
 
     return {
       adapterName: this.adapterName,
       providerVerified: this.verifiedInstrument?.verified === true,
       instrument: this.verifiedInstrument,
       quality: {
-        state: this.state,
+        state: evaluated.state,
         lastSuccessfulRequestUtc: this.lastSuccessfulRequestUtc,
         lastProviderCandleOpenUtc: this.lastProviderCandleOpenUtc,
         lastCompleteCandleCloseUtc: this.lastCompleteCandleCloseUtc,
-        freshnessSeconds,
+        freshnessSeconds: evaluated.freshnessSeconds,
         missingBarCount: this.missingBarCount,
         duplicateBarCount: this.duplicateBarCount,
         alignmentPolicy: this.alignmentPolicy,
-        warnings: [...this.warnings],
-        reasonCode: this.reasonCode,
+        warnings: evaluated.warnings,
+        reasonCode: evaluated.reasonCode,
       },
     };
   }

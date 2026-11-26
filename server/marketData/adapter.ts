@@ -64,8 +64,8 @@ export function redactSensitiveText(
   let sanitized = input
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
     .replace(/(authorization\s*[:=]\s*)([^\s,;]+)/gi, '$1[REDACTED]')
-    .replace(/([?&](?:token|api_key|apikey|key|secret)=)[^&\s]+/gi, '$1[REDACTED]')
-    .replace(/(https?:\/\/)[^/@\s]+@/gi, '$1[REDACTED]@');
+    .replace(/([?&](?:token|api_key|apikey|key|secret|password)=)[^&\s]+/gi, '$1[REDACTED]')
+    .replace(/((?:https?|postgres(?:ql)?):\/\/)[^/@\s]+@/gi, '$1[REDACTED]@');
 
   for (const secret of secrets) {
     if (secret && secret.trim().length >= 4) {

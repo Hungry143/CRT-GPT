@@ -2,6 +2,7 @@ import {
   resolveMarketDataRuntime,
   type MarketDataRuntime,
 } from '@/server/marketData/registry';
+import { buildMarketStatusPayload } from '@/server/routes/marketStatus';
 import {
   MarketSessionResponseSchema,
   type MarketSessionResponse,
@@ -14,7 +15,7 @@ export async function buildMarketSessionPayload(
   now: Date = new Date(),
   runtime: MarketDataRuntime = resolveMarketDataRuntime()
 ): Promise<MarketSessionResponse> {
-  const status = await runtime.adapter.getStatus(now);
+  const status = await buildMarketStatusPayload(now, runtime);
 
   let observedMarketAvailability: ObservedMarketAvailability =
     'UNOBSERVED_NO_FEED';
